@@ -115,27 +115,75 @@ export function isAllowedStatusTransition(from: OrderStatus, to: OrderStatus): b
   return Array.isArray(allowed) && allowed.includes(to);
 }
 
-const SAFE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+export const SAFE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 
-function getCryptoRandomIndex(max: number): number {
-  if (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.getRandomValues) {
-    const arr = new Uint32Array(1);
-    globalThis.crypto.getRandomValues(arr);
-    return arr[0] % max;
+export class CryptoUnavailableError extends Error {
+  public readonly code = 'CSPRNG_UNAVAILABLE';
+  constructor(
+    message = '安全随机数生成器 (CSPRNG) 不可用，已拒绝回退到非安全的 Math.random()。'
+  ) {
+    super(message);
+    this.name = 'CryptoUnavailableError';
   }
-  return Math.floor(Math.random() * max);
+}
+
+export type RandomBytesSource = (byteLength: number) => Uint8Array;
+
+function defaultCsprngBytes(byteLength: number): Uint8Array {
+  if (
+    typeof globalThis !== 'undefined' &&
+    globalThis.crypto &&
+    typeof globalThis.crypto.getRandomValues === 'function'
+  ) {
+    const buf = new Uint8Array(byteLength);
+    globalThis.crypto.getRandomValues(buf);
+    return buf;
+  }
+  throw new CryptoUnavailableError();
 }
 
 /**
- * Generate a unique internal order ID using CSPRNG
+ * Generates an unbiased random integer in [0, max) using CSPRNG rejection sampling.
+ * - Never falls back to Math.random() (P1-D).
+ * - Eliminates modulo bias for any 1 <= max <= 256 via rejection threshold `256 - (256 % max)`.
  */
-export function generateOrderId(): string {
-  if (typeof globalThis !== 'undefined' && globalThis.crypto && globalThis.crypto.randomUUID) {
+export function getSecureRandomIndex(
+  max: number,
+  randomBytesFn: RandomBytesSource = defaultCsprngBytes
+): number {
+  if (!Number.isInteger(max) || max <= 0 || max > 256) {
+    throw new RangeError(`max must be an integer between 1 and 256, got ${max}`);
+  }
+  if (max === 1) return 0;
+
+  const rejectionLimit = 256 - (256 % max);
+  for (let attempt = 0; attempt < 128; attempt++) {
+    const bytes = randomBytesFn(4);
+    for (let i = 0; i < bytes.length; i++) {
+      const val = bytes[i];
+      if (val < rejectionLimit) {
+        return val % max;
+      }
+    }
+  }
+  throw new CryptoUnavailableError('CSPRNG 拒绝采样超出最大尝试次数');
+}
+
+/**
+ * Generate a unique internal order ID using CSPRNG (never Math.random)
+ */
+export function generateOrderId(randomBytesFn?: RandomBytesSource): string {
+  if (
+    !randomBytesFn &&
+    typeof globalThis !== 'undefined' &&
+    globalThis.crypto &&
+    typeof globalThis.crypto.randomUUID === 'function'
+  ) {
     return `ord-${globalThis.crypto.randomUUID()}`;
   }
   let suffix = '';
   for (let i = 0; i < 16; i++) {
-    suffix += SAFE_ALPHABET.charAt(getCryptoRandomIndex(SAFE_ALPHABET.length));
+    suffix += SAFE_ALPHABET.charAt(getSecureRandomIndex(SAFE_ALPHABET.length, randomBytesFn));
   }
   return `ord-${Date.now()}-${suffix}`;
 }
@@ -143,13 +191,18 @@ export function generateOrderId(): string {
 /**
  * Generate a readable unique order number: GEO-YYYYMMDD-XXXXXX (6 random chars from 32-char alphabet)
  */
-export function generateOrderNumber(date: Date = new Date()): string {
+export function generateOrderNumber(
+  date: Date = new Date(),
+  randomBytesFn?: RandomBytesSource
+): string {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
   const d = String(date.getDate()).padStart(2, '0');
   let randomPart = '';
   for (let i = 0; i < 6; i++) {
-    randomPart += SAFE_ALPHABET.charAt(getCryptoRandomIndex(SAFE_ALPHABET.length));
+    randomPart += SAFE_ALPHABET.charAt(
+      getSecureRandomIndex(SAFE_ALPHABET.length, randomBytesFn)
+    );
   }
   return `GEO-${y}${m}${d}-${randomPart}`;
 }
@@ -157,15 +210,29 @@ export function generateOrderNumber(date: Date = new Date()): string {
 /**
  * Generate a high-entropy customer query token: QK-XXXX-XXXX-XXXX (12 random base32 chars = 60 bits entropy)
  */
-export function generateQueryToken(): string {
+export function generateQueryToken(randomBytesFn?: RandomBytesSource): string {
   const group = () => {
     let s = '';
     for (let i = 0; i < 4; i++) {
-      s += SAFE_ALPHABET.charAt(getCryptoRandomIndex(SAFE_ALPHABET.length));
+      s += SAFE_ALPHABET.charAt(getSecureRandomIndex(SAFE_ALPHABET.length, randomBytesFn));
     }
     return s;
   };
   return `QK-${group()}-${group()}-${group()}`;
+}
+
+/**
+ * Generate a high-entropy 128-bit client idempotency key for a single submission session (P1-A)
+ */
+export function generateClientIdempotencyKey(
+  randomBytesFn: RandomBytesSource = defaultCsprngBytes
+): string {
+  const bytes = randomBytesFn(16);
+  let hex = '';
+  for (let i = 0; i < bytes.length; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return `idem_${hex}`;
 }
 
 /**
@@ -233,6 +300,7 @@ export interface OrderInputPayload {
   contactValue: string;
   agreePrivacy: boolean;
   honeypot?: string;
+  forceNewOrder?: boolean;
 }
 
 export interface ValidationResult {

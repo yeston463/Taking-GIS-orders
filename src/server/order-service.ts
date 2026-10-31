@@ -1,13 +1,20 @@
-import crypto from 'crypto';
-import fs from 'fs';
-import path from 'path';
-import { App, cert, applicationDefault, getApps, initializeApp } from 'firebase-admin/app';
+import crypto from 'node:crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import { getFirestore, Firestore } from 'firebase-admin/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
+import {
+  getFirebaseServerConfig,
+  getFirebaseAdminApp,
+  verifyFirebaseConfigConsistency,
+  getRequiredQueryTokenPepper,
+  ServerConfigError,
+  type FirebaseConsistencyReport,
+} from '../config/firebase-server.ts';
 import {
   OrderItem,
   OrderInputPayload,
   AdminOrderUpdateInput,
+  SAFE_ALPHABET,
   generateOrderId,
   generateOrderNumber,
   generateQueryToken,
@@ -19,23 +26,61 @@ import {
   PublicOrderView,
 } from '../utils/order-utils.ts';
 
+export {
+  getFirebaseServerConfig,
+  getFirebaseAdminApp,
+  verifyFirebaseConfigConsistency,
+  getRequiredQueryTokenPepper,
+  type FirebaseConsistencyReport,
+};
+
 export class DatabaseUnavailableError extends Error {
   public readonly statusCode = 503;
   public readonly code: string;
-  constructor(message: string, code = 'DATABASE_UNAVAILABLE') {
+  public readonly retryable = true;
+  public readonly internalDiagnostic?: string;
+  constructor(
+    message: string,
+    code = 'DATABASE_UNAVAILABLE',
+    internalDiagnostic?: string
+  ) {
     super(message);
     this.name = 'DatabaseUnavailableError';
     this.code = code;
+    this.internalDiagnostic = internalDiagnostic;
   }
 }
 
-export class ConfigurationError extends Error {
+export const ConfigurationError = ServerConfigError;
+export type ConfigurationError = ServerConfigError;
+
+export type RateLimitFailureCategory =
+  | 'TIMEOUT'
+  | 'PERMISSION_DENIED'
+  | 'NETWORK_UNAVAILABLE'
+  | 'TRANSACTION_CONFLICT'
+  | 'UNKNOWN';
+
+export type RateLimitScope =
+  | 'order_create'
+  | 'order_lookup_ip'
+  | 'order_lookup_target';
+
+export class RateLimitServiceUnavailableError extends Error {
   public readonly statusCode = 503;
-  public readonly code: string;
-  constructor(message: string, code = 'CONFIGURATION_ERROR') {
+  public readonly code = 'RATE_LIMIT_BACKEND_UNAVAILABLE';
+  public readonly retryable = true;
+  public readonly failureCategory: RateLimitFailureCategory;
+  public readonly scope: RateLimitScope;
+  constructor(
+    failureCategory: RateLimitFailureCategory,
+    scope: RateLimitScope,
+    message = '安全限流校验服务暂时繁忙或不可用，为保障工单安全已暂停本次请求，请稍后重试。'
+  ) {
     super(message);
-    this.name = 'ConfigurationError';
-    this.code = code;
+    this.name = 'RateLimitServiceUnavailableError';
+    this.failureCategory = failureCategory;
+    this.scope = scope;
   }
 }
 
@@ -57,39 +102,26 @@ export class OrderNotFoundError extends Error {
   }
 }
 
-const FORBIDDEN_PEPPER_PLACEHOLDERS = new Set([
-  'my_query_token_pepper',
-  'replace-with-32-byte-random-secret-in-production',
-  'geospatial-studio-v2-token-pepper',
-  'your-secret-pepper',
-  'changeme',
-  'default',
-]);
-
-/**
- * Reads and validates QUERY_TOKEN_PEPPER strictly from server-side environment/Secrets.
- * Never falls back to a hardcoded default pepper (Requirement 5).
- */
-export function getRequiredQueryTokenPepper(overridePepper?: string): string {
-  const raw = (
-    overridePepper !== undefined ? overridePepper : process.env.QUERY_TOKEN_PEPPER || ''
-  ).trim();
-
-  if (!raw) {
-    throw new ConfigurationError(
-      '服务端缺少必需的安全密钥配置 QUERY_TOKEN_PEPPER。请在 AI Studio Secrets 或环境变量中配置至少 16 字符（推荐 32 字节 hex）的随机密钥，严禁使用硬编码默认值。',
-      'CONFIG_MISSING_QUERY_TOKEN_PEPPER'
-    );
+export class DuplicateOrderConflictError extends Error {
+  public readonly statusCode = 409;
+  public readonly code = 'DUPLICATE_SUBMISSION_REQUIRES_MANUAL_RECOVERY';
+  public readonly orderNumber: string;
+  public readonly order: PublicOrderView;
+  public readonly recoveryInstructions: string;
+  constructor(order: OrderItem) {
+    const publicView = toPublicOrderView(order);
+    const instructions =
+      '系统检测到您在短时间内已提交过完全相同的需求（工单号：' +
+      order.orderNumber +
+      '）。为保护客户隐私，数据库不保存明文查询凭证；因当前请求缺少首次提交会话的幂等恢复标识（例如已关闭重新打开页面），系统无法直接回显原查询凭证。若您未保存首次生成的查询凭证，请通过提交时预留的联系方式（' +
+      publicView.maskedContact +
+      '）联系工程师进行人工核验并重新签发查询凭证；若您确实需要发起另一笔独立新委托，请点击“确认创建新工单”。';
+    super(instructions);
+    this.name = 'DuplicateOrderConflictError';
+    this.orderNumber = order.orderNumber;
+    this.order = publicView;
+    this.recoveryInstructions = instructions;
   }
-
-  if (FORBIDDEN_PEPPER_PLACEHOLDERS.has(raw.toLowerCase()) || raw.length < 16) {
-    throw new ConfigurationError(
-      '服务端 QUERY_TOKEN_PEPPER 配置不安全（长度不足 16 字符或使用了示例占位符）。请使用安全随机值（如 openssl rand -hex 32）。',
-      'CONFIG_WEAK_QUERY_TOKEN_PEPPER'
-    );
-  }
-
-  return raw;
 }
 
 /**
@@ -119,7 +151,6 @@ export function verifyQueryToken(
   storedHash?: string,
   overridePepper?: string
 ): boolean {
-  // Always validate that QUERY_TOKEN_PEPPER is configured before attempting verification
   const pepper = getRequiredQueryTokenPepper(overridePepper);
   if (!storedHash || typeof storedHash !== 'string' || storedHash.length !== 64) {
     return false;
@@ -135,40 +166,139 @@ export function verifyQueryToken(
   }
 }
 
+export function isValidExplicitIdempotencyKey(key?: string): key is string {
+  if (!key || typeof key !== 'string') return false;
+  const trimmed = key.trim();
+  return trimmed.length >= 16 && trimmed.length <= 128 && /^[A-Za-z0-9_\-:]+$/.test(trimmed);
+}
+
 /**
- * Compute a deterministic idempotency key for a submission within a time bucket (60s)
+ * Deterministically derives a 60-bit query token (QK-XXXX-XXXX-XXXX) for an explicit
+ * client idempotency session key + orderNumber + contactValue + server secret pepper.
+ *
+ * Security properties (P1-A):
+ * 1. Plaintext queryToken is NEVER stored in Firestore (only `queryTokenHash` is stored).
+ * 2. If the HTTP response is lost due to a network drop and the client retries with the
+ *    exact same high-entropy `X-Idempotency-Key` and payload within the idempotency window,
+ *    the server can recompute this token in memory, verify it against `order.queryTokenHash`,
+ *    and return the valid token idempotently.
+ * 3. Without BOTH the server's `QUERY_TOKEN_PEPPER` and the client's 128-bit `X-Idempotency-Key`,
+ *    no third party knowing only `orderNumber` can ever derive the token.
+ * 4. Once an admin rotates the order's query token (`rotateOrderQueryTokenByAdmin`),
+ *    `order.queryTokenHash` changes to a random token hash, immediately invalidating replay.
  */
-export function computeSubmissionIdempotencyKey(
-  ip: string,
-  payload: OrderInputPayload,
-  explicitKey?: string
+export function deriveSessionQueryToken(
+  orderNumber: string,
+  explicitIdempotencyKey: string,
+  contactValue: string,
+  overridePepper?: string
 ): string {
-  if (explicitKey && typeof explicitKey === 'string' && explicitKey.trim().length >= 8) {
-    return crypto
-      .createHash('sha256')
-      .update(`explicit:${ip}:${explicitKey.trim().slice(0, 128)}`)
-      .digest('hex')
-      .slice(0, 40);
+  const pepper = getRequiredQueryTokenPepper(overridePepper);
+  const digest = crypto
+    .createHmac('sha256', pepper)
+    .update(
+      [
+        'qk_session_v3',
+        orderNumber.trim().toUpperCase(),
+        explicitIdempotencyKey.trim(),
+        contactValue.trim().toLowerCase(),
+      ].join('|')
+    )
+    .digest();
+
+  // 32 divides 256 evenly (256 = 8 * 32), so digest[i] & 31 is completely unbiased
+  const chars: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    chars.push(SAFE_ALPHABET.charAt(digest[i] & 31));
   }
-  const timeBucket = Math.floor(Date.now() / 60000); // 60-second deduplication window
+  return `QK-${chars.slice(0, 4).join('')}-${chars.slice(4, 8).join('')}-${chars
+    .slice(8, 12)
+    .join('')}`;
+}
+
+export const IDEMPOTENCY_EXPLICIT_TTL_MS = 15 * 60 * 1000; // 15 minutes for explicit key retries
+export const IDEMPOTENCY_CONTENT_WINDOW_MS = 60 * 1000; // 60 seconds for accidental tab-reopen duplicate submit
+
+/**
+ * Computes the payload content & contact fingerprint so two different customers
+ * or two different order descriptions never collide even if an idempotency key is reused.
+ */
+export function computeOrderContentDigest(payload: OrderInputPayload): string {
   const raw = [
-    ip,
-    timeBucket,
     payload.serviceType,
     payload.title?.trim(),
     payload.description?.trim(),
+    payload.studyArea?.trim() || '',
+    payload.dataFormats?.trim() || '',
+    payload.budgetRange || '',
+    payload.expectedDeliveryDate || '',
     payload.contactMethod,
     payload.contactValue?.trim().toLowerCase(),
   ].join('|');
-  return crypto.createHash('sha256').update(raw).digest('hex').slice(0, 40);
+  return crypto.createHash('sha256').update(raw).digest('hex');
+}
+
+/**
+ * Compute a deterministic idempotency storage key:
+ * - When `explicitKey` is provided: scoped to `explicitKey + contactValue + contentDigest`
+ *   so it never merges orders across different customers or modified form payloads.
+ * - When `explicitKey` is absent: scoped to a 60-second time bucket + contactValue + contentDigest.
+ */
+export function computeSubmissionIdempotencyKey(
+  _ip: string,
+  payload: OrderInputPayload,
+  explicitKey?: string
+): string {
+  const contentDigest = computeOrderContentDigest(payload);
+  const contactNorm = `${payload.contactMethod}:${payload.contactValue.trim().toLowerCase()}`;
+
+  if (isValidExplicitIdempotencyKey(explicitKey)) {
+    return crypto
+      .createHash('sha256')
+      .update(`explicit_v3|${explicitKey.trim()}|${contactNorm}|${contentDigest}`)
+      .digest('hex')
+      .slice(0, 40);
+  }
+
+  const timeBucket = Math.floor(Date.now() / IDEMPOTENCY_CONTENT_WINDOW_MS);
+  return crypto
+    .createHash('sha256')
+    .update(`content_v3|${timeBucket}|${contactNorm}|${contentDigest}`)
+    .digest('hex')
+    .slice(0, 40);
+}
+
+export interface IdempotencyRecord {
+  orderNumber: string;
+  mode: 'explicit_key' | 'content_fingerprint';
+  contentDigest: string;
+  createdAt: string;
+  expiresAt: number;
+}
+
+export interface RateLimitDetail {
+  allowed: boolean;
+  remaining: number;
+  retryAfterSeconds: number;
+  source: 'authoritative-store' | 'l1-precheck-reject';
 }
 
 export interface OrderRepository {
   readonly driverName: string;
   createOrderAtomic(
     buildOrder: (orderNumber: string) => OrderItem,
-    idempotencyKey: string
-  ): Promise<{ order: OrderItem; duplicate: boolean }>;
+    idempotencyKey: string,
+    idempotencyMeta?: {
+      mode: 'explicit_key' | 'content_fingerprint';
+      contentDigest: string;
+      ttlMs: number;
+      bypassExisting?: boolean;
+    }
+  ): Promise<{
+    order: OrderItem;
+    duplicate: boolean;
+    matchedMode?: 'explicit_key' | 'content_fingerprint';
+  }>;
   getOrderByNumber(orderNumber: string): Promise<OrderItem | null>;
   getOrderByIdOrNumber(idOrNumber: string): Promise<OrderItem | null>;
   listOrders(): Promise<OrderItem[]>;
@@ -176,131 +306,84 @@ export interface OrderRepository {
     idOrNumber: string,
     updater: (existing: OrderItem) => OrderItem
   ): Promise<OrderItem>;
-  checkRateLimit(key: string, limit: number, windowMs: number): Promise<boolean>;
-}
-
-let sharedAdminApp: App | null = null;
-let activeCredentialSource: 'adc' | 'service_account_env' = 'adc';
-
-/**
- * Initializes Firebase Admin SDK prioritizing Google Cloud Application Default Credentials (ADC).
- * - On Cloud Run (in project gen-lang-client-0041017161), ADC works natively via the metadata server
- *   without exporting or uploading any private key JSON.
- * - Minimal IAM roles required for the Cloud Run service account:
- *   1. roles/datastore.user (Cloud Firestore read/write/transaction access)
- *   2. roles/firebaseauth.viewer (Firebase Auth token & metadata verification)
- */
-export function getFirebaseAdminApp(): App {
-  if (sharedAdminApp) return sharedAdminApp;
-  const existing = getApps().find((a) => a.name === 'geospatial-admin');
-  if (existing) {
-    sharedAdminApp = existing;
-    return existing;
-  }
-
-  // Priority 1 (Standard & Recommended): Google Cloud Application Default Credentials (ADC)
-  const saJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON?.trim();
-  if (!saJson) {
-    activeCredentialSource = 'adc';
-    sharedAdminApp = initializeApp(
-      {
-        credential: applicationDefault(),
-        projectId: firebaseConfig.projectId,
-      },
-      'geospatial-admin'
-    );
-    return sharedAdminApp;
-  }
-
-  // Priority 2 (Optional fallback only if explicitly provided in external non-GCP environments)
-  try {
-    const parsed = JSON.parse(saJson);
-    if (parsed.project_id && parsed.project_id !== firebaseConfig.projectId) {
-      throw new ConfigurationError(
-        `FIREBASE_SERVICE_ACCOUNT_JSON 中的 project_id (${parsed.project_id}) 与应用配置的 projectId (${firebaseConfig.projectId}) 不一致。`,
-        'CONFIG_PROJECT_ID_MISMATCH'
-      );
-    }
-    activeCredentialSource = 'service_account_env';
-    sharedAdminApp = initializeApp(
-      {
-        credential: cert(parsed),
-        projectId: firebaseConfig.projectId,
-      },
-      'geospatial-admin'
-    );
-    return sharedAdminApp;
-  } catch (err: any) {
-    if (err instanceof ConfigurationError) throw err;
-    throw new ConfigurationError(
-      '提供的 FIREBASE_SERVICE_ACCOUNT_JSON 格式无效。推荐清空此变量以直接使用 Google Cloud 默认凭证 (ADC)。',
-      'CONFIG_INVALID_SERVICE_ACCOUNT_JSON'
-    );
-  }
-}
-
-export interface FirebaseConsistencyReport {
-  consistent: boolean;
-  clientProjectId: string;
-  adminProjectId: string;
-  authDomainProjectId: string;
-  firestoreDatabaseId: string;
-  credentialSource: 'adc' | 'service_account_env';
-  runtimeEnvironment: 'cloud_run' | 'ai_studio_preview_sandbox' | 'local_or_custom';
-  adcServiceAccountEmail: string | null;
-  crossProjectAdcWarning: string | null;
+  checkRateLimit(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope?: RateLimitScope
+  ): Promise<boolean>;
+  checkRateLimitDetailed?(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope?: RateLimitScope
+  ): Promise<RateLimitDetail>;
 }
 
 /**
- * Verifies consistency across Firebase Admin SDK, Client Config, Auth Project ID, and Firestore Database ID (Requirement 8).
+ * Lightweight in-process L1 pre-check (Reject-Only):
+ * - If a single instance ALREADY knows a key has exceeded `limit` in the current window,
+ *   it rejects immediately without spending Firestore read/write quota (Denial-of-Wallet protection).
+ * - L1 NEVER approves a request on its own: any request not rejected by L1 MUST still pass
+ *   the authoritative multi-instance store (`FirestoreAdminOrderRepository` or `IsolatedTestOrderRepository`).
  */
-export function verifyFirebaseConfigConsistency(): FirebaseConsistencyReport {
-  const app = getFirebaseAdminApp();
-  const clientProjectId = firebaseConfig.projectId;
-  const adminProjectId = app.options.projectId || '';
-  const authDomainProjectId = (firebaseConfig.authDomain || '').split('.')[0] || '';
-  const firestoreDatabaseId = firebaseConfig.firestoreDatabaseId;
+interface L1Bucket {
+  count: number;
+  windowStart: number;
+}
+const l1RejectBuckets = new Map<string, L1Bucket>();
 
-  const isCloudRun = Boolean(process.env.K_SERVICE);
-  const adcEmail = process.env.AUTHORIZED_SERVICE_ACCOUNT_EMAIL || null;
-  const isAiStudioSandbox =
-    Boolean(adcEmail && adcEmail.includes('ais-sandbox@')) ||
-    Boolean(process.env.GOOGLE_APPLICATION_CREDENTIALS?.includes('ais-shim'));
-
-  const runtimeEnvironment = isCloudRun
-    ? 'cloud_run'
-    : isAiStudioSandbox
-    ? 'ai_studio_preview_sandbox'
-    : 'local_or_custom';
-
-  const consistent =
-    Boolean(clientProjectId) &&
-    clientProjectId === adminProjectId &&
-    clientProjectId === authDomainProjectId &&
-    Boolean(firestoreDatabaseId) &&
-    firestoreDatabaseId.startsWith('ai-studio-');
-
-  let crossProjectAdcWarning: string | null = null;
-  if (
-    activeCredentialSource === 'adc' &&
-    adcEmail &&
-    !adcEmail.endsWith(`@${clientProjectId}.iam.gserviceaccount.com`) &&
-    !adcEmail.includes(clientProjectId)
-  ) {
-    crossProjectAdcWarning = `当前运行容器的 ADC 默认服务账号 (${adcEmail}) 属于宿主沙箱项目，而非目标 Firebase 项目 (${clientProjectId})。Firebase Auth ID Token 公钥验签可正常工作，但直接读写 Firestore 需将应用部署至目标项目 (${clientProjectId}) 的 Cloud Run，或在 IAM 中为该账号授予 roles/datastore.user。`;
+function precheckL1RejectOnly(
+  safeKey: string,
+  limit: number,
+  windowMs: number,
+  now: number
+): { rejected: boolean; retryAfterSeconds: number } {
+  const existing = l1RejectBuckets.get(safeKey);
+  if (!existing || now - existing.windowStart >= windowMs) {
+    return { rejected: false, retryAfterSeconds: 0 };
   }
+  if (existing.count >= limit) {
+    const retryAfterSeconds = Math.max(
+      1,
+      Math.ceil((existing.windowStart + windowMs - now) / 1000)
+    );
+    return { rejected: true, retryAfterSeconds };
+  }
+  return { rejected: false, retryAfterSeconds: 0 };
+}
 
-  return {
-    consistent,
-    clientProjectId,
-    adminProjectId,
-    authDomainProjectId,
-    firestoreDatabaseId,
-    credentialSource: activeCredentialSource,
-    runtimeEnvironment,
-    adcServiceAccountEmail: adcEmail,
-    crossProjectAdcWarning,
-  };
+function recordL1Observation(
+  safeKey: string,
+  count: number,
+  windowStart: number
+): void {
+  if (l1RejectBuckets.size > 5000) {
+    l1RejectBuckets.clear();
+  }
+  l1RejectBuckets.set(safeKey, { count, windowStart });
+}
+
+export function clearL1RateLimitCacheForTests(): void {
+  l1RejectBuckets.clear();
+}
+
+function classifyFirestoreRateLimitError(err: any): RateLimitFailureCategory {
+  const code = err?.code;
+  const msg = String(err?.message || err || '').toUpperCase();
+  if (code === 4 || msg.includes('DEADLINE_EXCEEDED') || msg.includes('TIMEOUT')) {
+    return 'TIMEOUT';
+  }
+  if (code === 7 || msg.includes('PERMISSION_DENIED')) {
+    return 'PERMISSION_DENIED';
+  }
+  if (code === 10 || msg.includes('ABORTED') || msg.includes('TRANSACTION')) {
+    return 'TRANSACTION_CONFLICT';
+  }
+  if (code === 14 || msg.includes('UNAVAILABLE') || msg.includes('NETWORK')) {
+    return 'NETWORK_UNAVAILABLE';
+  }
+  return 'UNKNOWN';
 }
 
 /**
@@ -315,8 +398,9 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
   private readonly rateLimitCollection: string;
 
   constructor(collectionPrefix = '') {
-    const app = getFirebaseAdminApp();
-    this.db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
+    const serverCfg = getFirebaseServerConfig();
+    const app = getFirebaseAdminApp(serverCfg);
+    this.db = getFirestore(app, serverCfg.firestoreDatabaseId);
     this.ordersCollection = collectionPrefix ? `${collectionPrefix}_orders` : 'orders';
     this.idempotencyCollection = collectionPrefix
       ? `${collectionPrefix}_idempotencyKeys`
@@ -327,36 +411,62 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
   private wrapFirestoreError(err: any, operation: string): never {
     const code = err?.code;
     const msg = err?.message || String(err);
-    console.error(`[FirestoreAdminOrderRepository] ${operation} failed (code=${code}): ${msg}`);
-    if (code === 7 || msg.includes('PERMISSION_DENIED')) {
-      const adcEmail = process.env.AUTHORIZED_SERVICE_ACCOUNT_EMAIL || '当前容器默认服务账号';
+    const serverCfg = getFirebaseServerConfig();
+    const internalDiag = `[FirestoreAdminOrderRepository] op=${operation} code=${code} project=${serverCfg.projectId} db=${serverCfg.firestoreDatabaseId} msg=${msg}`;
+    console.error(internalDiag);
+
+    if (code === 7 || String(msg).includes('PERMISSION_DENIED')) {
       throw new DatabaseUnavailableError(
-        `Firestore 权威数据库访问被拒绝 (PERMISSION_DENIED)：当前环境使用 Google Cloud 默认凭证 (ADC: ${adcEmail}) 访问项目 ${firebaseConfig.projectId} 的数据库 ${firebaseConfig.firestoreDatabaseId} 时缺少 IAM 权限。在 Cloud Run 部署时请确保运行服务账号具备最小权限 roles/datastore.user；在 AI Studio 预览沙箱中因跨项目隔离限制，系统已安全拒绝写入以防数据静默丢失。`,
-        'FIRESTORE_IAM_PERMISSION_DENIED'
+        '订单存储服务当前缺少云端数据库访问授权，系统已安全拒绝写入以防止数据静默丢失，请稍后重试或联系管理员。',
+        'FIRESTORE_IAM_PERMISSION_DENIED',
+        internalDiag
       );
     }
     throw new DatabaseUnavailableError(
       '订单数据库暂时不可用，请稍后重试。系统未保存任何半成品数据。',
-      'FIRESTORE_OPERATION_FAILED'
+      'FIRESTORE_OPERATION_FAILED',
+      internalDiag
     );
   }
 
   async createOrderAtomic(
     buildOrder: (orderNumber: string) => OrderItem,
-    idempotencyKey: string
-  ): Promise<{ order: OrderItem; duplicate: boolean }> {
+    idempotencyKey: string,
+    idempotencyMeta?: {
+      mode: 'explicit_key' | 'content_fingerprint';
+      contentDigest: string;
+      ttlMs: number;
+      bypassExisting?: boolean;
+    }
+  ): Promise<{
+    order: OrderItem;
+    duplicate: boolean;
+    matchedMode?: 'explicit_key' | 'content_fingerprint';
+  }> {
+    const nowMs = Date.now();
+    const metaMode = idempotencyMeta?.mode || 'content_fingerprint';
+    const ttlMs = idempotencyMeta?.ttlMs || IDEMPOTENCY_EXPLICIT_TTL_MS;
+
     try {
       return await this.db.runTransaction(async (tx) => {
         const idemRef = this.db.collection(this.idempotencyCollection).doc(idempotencyKey);
-        const idemSnap = await tx.get(idemRef);
-        if (idemSnap.exists) {
-          const prevOrderNumber = idemSnap.data()?.orderNumber as string | undefined;
-          if (prevOrderNumber) {
-            const prevOrderSnap = await tx.get(
-              this.db.collection(this.ordersCollection).doc(prevOrderNumber)
-            );
-            if (prevOrderSnap.exists) {
-              return { order: prevOrderSnap.data() as OrderItem, duplicate: true };
+        if (!idempotencyMeta?.bypassExisting) {
+          const idemSnap = await tx.get(idemRef);
+          if (idemSnap.exists) {
+            const idemData = idemSnap.data() as Partial<IdempotencyRecord> | undefined;
+            const expiresAt = typeof idemData?.expiresAt === 'number' ? idemData.expiresAt : 0;
+            const prevOrderNumber = idemData?.orderNumber;
+            if (prevOrderNumber && nowMs <= expiresAt) {
+              const prevOrderSnap = await tx.get(
+                this.db.collection(this.ordersCollection).doc(prevOrderNumber)
+              );
+              if (prevOrderSnap.exists) {
+                return {
+                  order: prevOrderSnap.data() as OrderItem,
+                  duplicate: true,
+                  matchedMode: idemData?.mode || metaMode,
+                };
+              }
             }
           }
         }
@@ -383,11 +493,13 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
         tx.set(orderRef, cleaned);
         tx.set(idemRef, {
           orderNumber: candidateOrder.orderNumber,
+          mode: metaMode,
+          contentDigest: idempotencyMeta?.contentDigest || '',
           createdAt: candidateOrder.createdAt,
-          expiresAt: Date.now() + 10 * 60 * 1000,
-        });
+          expiresAt: nowMs + ttlMs,
+        } satisfies IdempotencyRecord);
 
-        return { order: candidateOrder, duplicate: false };
+        return { order: candidateOrder, duplicate: false, matchedMode: metaMode };
       });
     } catch (err: any) {
       if (
@@ -488,52 +600,133 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     }
   }
 
-  async checkRateLimit(key: string, limit: number, windowMs: number): Promise<boolean> {
+  async checkRateLimitDetailed(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope: RateLimitScope = 'order_create'
+  ): Promise<RateLimitDetail> {
     const safeKey = crypto.createHash('sha256').update(key).digest('hex').slice(0, 32);
     const now = Date.now();
-    try {
-      return await this.db.runTransaction(async (tx) => {
-        const ref = this.db.collection(this.rateLimitCollection).doc(safeKey);
-        const snap = await tx.get(ref);
-        const rawTimestamps: number[] =
-          snap.exists && Array.isArray(snap.data()?.timestamps) ? snap.data()!.timestamps : [];
-        const valid = rawTimestamps.filter((t) => typeof t === 'number' && now - t < windowMs);
-        if (valid.length >= limit) {
-          return false;
-        }
-        valid.push(now);
-        tx.set(ref, { timestamps: valid, updatedAt: now });
-        return true;
-      });
-    } catch {
-      return checkLocalFallbackRateLimit(safeKey, limit, windowMs);
+
+    // Step 1: L1 reject-only pre-check (saves Firestore reads/writes when single instance already saturated)
+    const l1 = precheckL1RejectOnly(safeKey, limit, windowMs, now);
+    if (l1.rejected) {
+      return {
+        allowed: false,
+        remaining: 0,
+        retryAfterSeconds: l1.retryAfterSeconds,
+        source: 'l1-precheck-reject',
+      };
     }
-  }
-}
 
-const localRateLimitMap = new Map<string, number[]>();
+    // Step 2: Authoritative Firestore fixed-window transaction with transient conflict retry
+    const maxAttempts = 3;
+    let lastErr: any = null;
 
-function checkLocalFallbackRateLimit(key: string, limit: number, windowMs: number): boolean {
-  const now = Date.now();
-  const timestamps = localRateLimitMap.get(key) || [];
-  const valid = timestamps.filter((t) => now - t < windowMs);
-  if (valid.length >= limit) {
-    return false;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        const result = await this.db.runTransaction(async (tx) => {
+          const ref = this.db.collection(this.rateLimitCollection).doc(safeKey);
+          const snap = await tx.get(ref);
+          const currentNow = Date.now();
+
+          let count = 0;
+          let windowStart = currentNow;
+
+          if (snap.exists) {
+            const data = snap.data() || {};
+            if (
+              typeof data.windowStart === 'number' &&
+              typeof data.count === 'number' &&
+              currentNow - data.windowStart < windowMs
+            ) {
+              windowStart = data.windowStart;
+              count = data.count;
+            }
+          }
+
+          if (count >= limit) {
+            const retryAfterSeconds = Math.max(
+              1,
+              Math.ceil((windowStart + windowMs - currentNow) / 1000)
+            );
+            return {
+              allowed: false,
+              count,
+              windowStart,
+              remaining: 0,
+              retryAfterSeconds,
+            };
+          }
+
+          const nextCount = count + 1;
+          tx.set(ref, {
+            count: nextCount,
+            windowStart,
+            expiresAt: windowStart + windowMs,
+            updatedAt: currentNow,
+          });
+
+          return {
+            allowed: true,
+            count: nextCount,
+            windowStart,
+            remaining: Math.max(0, limit - nextCount),
+            retryAfterSeconds: 0,
+          };
+        });
+
+        recordL1Observation(safeKey, result.count, result.windowStart);
+        return {
+          allowed: result.allowed,
+          remaining: result.remaining,
+          retryAfterSeconds: result.retryAfterSeconds,
+          source: 'authoritative-store',
+        };
+      } catch (err: any) {
+        lastErr = err;
+        const category = classifyFirestoreRateLimitError(err);
+        if (category === 'TRANSACTION_CONFLICT' && attempt < maxAttempts) {
+          await new Promise((r) => setTimeout(r, 20 * attempt));
+          continue;
+        }
+        break;
+      }
+    }
+
+    const category = classifyFirestoreRateLimitError(lastErr);
+    console.error(
+      `[RateLimitFailure] scope=${scope} category=${category} msg=${lastErr?.message || lastErr}`
+    );
+    // P1-B: Never silently degrade to local memory rate limiting when Firestore fails!
+    throw new RateLimitServiceUnavailableError(category, scope);
   }
-  valid.push(now);
-  localRateLimitMap.set(key, valid);
-  return true;
+
+  async checkRateLimit(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope: RateLimitScope = 'order_create'
+  ): Promise<boolean> {
+    const res = await this.checkRateLimitDetailed(key, limit, windowMs, scope);
+    return res.allowed;
+  }
 }
 
 /**
- * Isolated Transactional Test Repository for automated integration & restart tests
+ * Isolated Transactional Test Repository for automated integration & restart tests.
  * ONLY allowed when NODE_ENV === 'test' or ORDER_DB_DRIVER === 'test_isolated'.
  * Strictly forbidden in production.
+ * NOTE (P0-B.8): This file-backed repository verifies application-layer state persistence
+ * across Express server restarts and process instances sharing a transactional store;
+ * it does NOT replace live Cloud Firestore network/IAM verification.
  */
 export class IsolatedTestOrderRepository implements OrderRepository {
   public readonly driverName = 'test-isolated-transactional';
   private readonly storageFilePath: string;
   private simulateFailure = false;
+  private simulateRateLimitFailureCategory: RateLimitFailureCategory | null = null;
   private mutex: Promise<void> = Promise.resolve();
 
   constructor(storageFilePath?: string) {
@@ -548,6 +741,10 @@ export class IsolatedTestOrderRepository implements OrderRepository {
 
   public setSimulateFailure(fail: boolean) {
     this.simulateFailure = fail;
+  }
+
+  public setSimulateRateLimitFailure(category: RateLimitFailureCategory | null) {
+    this.simulateRateLimitFailureCategory = category;
   }
 
   private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -573,8 +770,8 @@ export class IsolatedTestOrderRepository implements OrderRepository {
 
   private readState(): {
     orders: Record<string, OrderItem>;
-    idempotency: Record<string, string>;
-    rateLimits: Record<string, number[]>;
+    idempotency: Record<string, IdempotencyRecord | string>;
+    rateLimits: Record<string, { count: number; windowStart: number } | number[]>;
   } {
     try {
       if (fs.existsSync(this.storageFilePath)) {
@@ -594,8 +791,8 @@ export class IsolatedTestOrderRepository implements OrderRepository {
 
   private writeState(state: {
     orders: Record<string, OrderItem>;
-    idempotency: Record<string, string>;
-    rateLimits: Record<string, number[]>;
+    idempotency: Record<string, IdempotencyRecord | string>;
+    rateLimits: Record<string, { count: number; windowStart: number } | number[]>;
   }) {
     const dir = path.dirname(this.storageFilePath);
     if (!fs.existsSync(dir)) {
@@ -608,13 +805,46 @@ export class IsolatedTestOrderRepository implements OrderRepository {
 
   async createOrderAtomic(
     buildOrder: (orderNumber: string) => OrderItem,
-    idempotencyKey: string
-  ): Promise<{ order: OrderItem; duplicate: boolean }> {
+    idempotencyKey: string,
+    idempotencyMeta?: {
+      mode: 'explicit_key' | 'content_fingerprint';
+      contentDigest: string;
+      ttlMs: number;
+      bypassExisting?: boolean;
+    }
+  ): Promise<{
+    order: OrderItem;
+    duplicate: boolean;
+    matchedMode?: 'explicit_key' | 'content_fingerprint';
+  }> {
     return this.withLock(() => {
       const state = this.readState();
-      const existingOrderNo = state.idempotency[idempotencyKey];
-      if (existingOrderNo && state.orders[existingOrderNo]) {
-        return { order: state.orders[existingOrderNo], duplicate: true };
+      const nowMs = Date.now();
+      const metaMode = idempotencyMeta?.mode || 'content_fingerprint';
+      const ttlMs = idempotencyMeta?.ttlMs || IDEMPOTENCY_EXPLICIT_TTL_MS;
+
+      if (!idempotencyMeta?.bypassExisting) {
+        const rawEntry = state.idempotency[idempotencyKey];
+        if (rawEntry) {
+          const entryObj: IdempotencyRecord =
+            typeof rawEntry === 'string'
+              ? {
+                  orderNumber: rawEntry,
+                  mode: 'content_fingerprint',
+                  contentDigest: '',
+                  createdAt: new Date(nowMs).toISOString(),
+                  expiresAt: nowMs + ttlMs,
+                }
+              : rawEntry;
+
+          if (nowMs <= entryObj.expiresAt && state.orders[entryObj.orderNumber]) {
+            return {
+              order: state.orders[entryObj.orderNumber],
+              duplicate: true,
+              matchedMode: entryObj.mode,
+            };
+          }
+        }
       }
 
       let candidate: OrderItem | null = null;
@@ -630,9 +860,15 @@ export class IsolatedTestOrderRepository implements OrderRepository {
       }
 
       state.orders[candidate.orderNumber] = cleanOrderForFirestore(candidate) as OrderItem;
-      state.idempotency[idempotencyKey] = candidate.orderNumber;
+      state.idempotency[idempotencyKey] = {
+        orderNumber: candidate.orderNumber,
+        mode: metaMode,
+        contentDigest: idempotencyMeta?.contentDigest || '',
+        createdAt: candidate.createdAt,
+        expiresAt: nowMs + ttlMs,
+      };
       this.writeState(state);
-      return { order: candidate, duplicate: false };
+      return { order: candidate, duplicate: false, matchedMode: metaMode };
     });
   }
 
@@ -685,21 +921,91 @@ export class IsolatedTestOrderRepository implements OrderRepository {
     });
   }
 
-  async checkRateLimit(key: string, limit: number, windowMs: number): Promise<boolean> {
+  async checkRateLimitDetailed(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope: RateLimitScope = 'order_create'
+  ): Promise<RateLimitDetail> {
+    if (this.simulateRateLimitFailureCategory) {
+      throw new RateLimitServiceUnavailableError(
+        this.simulateRateLimitFailureCategory,
+        scope
+      );
+    }
+
+    const safeKey = crypto.createHash('sha256').update(key).digest('hex').slice(0, 32);
+    const now = Date.now();
+
+    const l1 = precheckL1RejectOnly(safeKey, limit, windowMs, now);
+    if (l1.rejected) {
+      return {
+        allowed: false,
+        remaining: 0,
+        retryAfterSeconds: l1.retryAfterSeconds,
+        source: 'l1-precheck-reject',
+      };
+    }
+
     return this.withLock(() => {
       const state = this.readState();
-      const now = Date.now();
-      const list = (state.rateLimits[key] || []).filter((t) => now - t < windowMs);
-      if (list.length >= limit) {
-        return false;
+      const currentNow = Date.now();
+      const existing = state.rateLimits[safeKey];
+
+      let count = 0;
+      let windowStart = currentNow;
+
+      if (
+        existing &&
+        !Array.isArray(existing) &&
+        typeof existing.windowStart === 'number' &&
+        typeof existing.count === 'number' &&
+        currentNow - existing.windowStart < windowMs
+      ) {
+        windowStart = existing.windowStart;
+        count = existing.count;
       }
-      list.push(now);
-      state.rateLimits[key] = list;
+
+      if (count >= limit) {
+        recordL1Observation(safeKey, count, windowStart);
+        const retryAfterSeconds = Math.max(
+          1,
+          Math.ceil((windowStart + windowMs - currentNow) / 1000)
+        );
+        return {
+          allowed: false,
+          remaining: 0,
+          retryAfterSeconds,
+          source: 'authoritative-store' as const,
+        };
+      }
+
+      const nextCount = count + 1;
+      state.rateLimits[safeKey] = { count: nextCount, windowStart };
       this.writeState(state);
-      return true;
+      recordL1Observation(safeKey, nextCount, windowStart);
+
+      return {
+        allowed: true,
+        remaining: Math.max(0, limit - nextCount),
+        retryAfterSeconds: 0,
+        source: 'authoritative-store' as const,
+      };
     });
   }
+
+  async checkRateLimit(
+    key: string,
+    limit: number,
+    windowMs: number,
+    scope: RateLimitScope = 'order_create'
+  ): Promise<boolean> {
+    const res = await this.checkRateLimitDetailed(key, limit, windowMs, scope);
+    return res.allowed;
+  }
 }
+
+export type OrderSubmissionStatus = 'CREATED' | 'IDEMPOTENT_REPLAY';
 
 /**
  * Controlled Order Service Layer wrapping the single authoritative OrderRepository
@@ -720,7 +1026,7 @@ export class OrderService {
   }
 
   /**
-   * Public Order Creation with validation, idempotency, token generation & hashing, and atomic persistence
+   * Public Order Creation with validation, idempotency, token generation & hashing, and atomic persistence (P1-A)
    */
   async createCustomerOrder(
     rawPayload: unknown,
@@ -730,9 +1036,9 @@ export class OrderService {
     orderNumber: string;
     queryToken: string;
     duplicate: boolean;
+    submissionStatus: OrderSubmissionStatus;
     order: PublicOrderView;
   }> {
-    // Validate QUERY_TOKEN_PEPPER is present before creating order
     const pepper = getRequiredQueryTokenPepper();
 
     const validation = validateOrderInput(rawPayload);
@@ -741,6 +1047,8 @@ export class OrderService {
     }
 
     const payload = rawPayload as OrderInputPayload;
+    const hasExplicitKey = isValidExplicitIdempotencyKey(explicitIdempotencyKey);
+    const contentDigest = computeOrderContentDigest(payload);
     const idempotencyKey = computeSubmissionIdempotencyKey(
       clientIp,
       payload,
@@ -750,40 +1058,88 @@ export class OrderService {
     let generatedToken = '';
     const now = new Date().toISOString();
 
-    const { order, duplicate } = await this.repo.createOrderAtomic((orderNumber: string) => {
-      generatedToken = generateQueryToken();
-      const tokenHash = hashQueryToken(orderNumber, generatedToken, pepper);
-      return {
-        id: generateOrderId(),
-        orderNumber,
-        serviceType: payload.serviceType as any,
-        title: payload.title.trim(),
-        description: payload.description.trim(),
-        studyArea: payload.studyArea?.trim() || '未指定特定区域',
-        dataFormats: payload.dataFormats?.trim() || '待沟通确定',
-        budgetRange: payload.budgetRange || '待评估',
-        expectedDeliveryDate: payload.expectedDeliveryDate || '',
-        contactMethod: payload.contactMethod,
-        contactValue: payload.contactValue.trim(),
-        status: 'pending_review',
-        adminNotes: '',
-        clientNotes: '需求已成功登记，工作室工程师正在查阅技术细节与数据要求。',
-        queryTokenHash: tokenHash,
-        queryTokenUpdatedAt: now,
-        isDemo: false,
-        createdAt: now,
-        updatedAt: now,
-      };
-    }, idempotencyKey);
+    const { order, duplicate, matchedMode } = await this.repo.createOrderAtomic(
+      (orderNumber: string) => {
+        generatedToken = hasExplicitKey
+          ? deriveSessionQueryToken(
+              orderNumber,
+              explicitIdempotencyKey!,
+              payload.contactValue,
+              pepper
+            )
+          : generateQueryToken();
 
-    return {
-      orderNumber: order.orderNumber,
-      queryToken: duplicate
-        ? '（重复提交请求已拦截，请使用首次返回的查询凭证）'
-        : generatedToken,
-      duplicate,
-      order: toPublicOrderView(order),
-    };
+        const tokenHash = hashQueryToken(orderNumber, generatedToken, pepper);
+        return {
+          id: generateOrderId(),
+          orderNumber,
+          serviceType: payload.serviceType as any,
+          title: payload.title.trim(),
+          description: payload.description.trim(),
+          studyArea: payload.studyArea?.trim() || '未指定特定区域',
+          dataFormats: payload.dataFormats?.trim() || '待沟通确定',
+          budgetRange: payload.budgetRange || '待评估',
+          expectedDeliveryDate: payload.expectedDeliveryDate || '',
+          contactMethod: payload.contactMethod,
+          contactValue: payload.contactValue.trim(),
+          status: 'pending_review',
+          adminNotes: '',
+          clientNotes: '需求已成功登记，工作室工程师正在查阅技术细节与数据要求。',
+          queryTokenHash: tokenHash,
+          queryTokenUpdatedAt: now,
+          isDemo: false,
+          createdAt: now,
+          updatedAt: now,
+        };
+      },
+      idempotencyKey,
+      {
+        mode: hasExplicitKey ? 'explicit_key' : 'content_fingerprint',
+        contentDigest,
+        ttlMs: hasExplicitKey ? IDEMPOTENCY_EXPLICIT_TTL_MS : IDEMPOTENCY_CONTENT_WINDOW_MS,
+        bypassExisting: payload.forceNewOrder === true,
+      }
+    );
+
+    if (!duplicate) {
+      return {
+        orderNumber: order.orderNumber,
+        queryToken: generatedToken,
+        duplicate: false,
+        submissionStatus: 'CREATED',
+        order: toPublicOrderView(order),
+      };
+    }
+
+    // Duplicate detected! Check if we can safely & cryptographically recover the session token (P1-A)
+    if (hasExplicitKey && matchedMode === 'explicit_key') {
+      const recoveredToken = deriveSessionQueryToken(
+        order.orderNumber,
+        explicitIdempotencyKey!,
+        payload.contactValue,
+        pepper
+      );
+      const tokenMatches = verifyQueryToken(
+        order.orderNumber,
+        recoveredToken,
+        order.queryTokenHash,
+        pepper
+      );
+
+      if (tokenMatches) {
+        return {
+          orderNumber: order.orderNumber,
+          queryToken: recoveredToken,
+          duplicate: true,
+          submissionStatus: 'IDEMPOTENT_REPLAY',
+          order: toPublicOrderView(order),
+        };
+      }
+    }
+
+    // Cannot safely recover plaintext queryToken (e.g. tab closed & reopened without session key, or token already rotated by admin)
+    // P1-A.6: Never return HTTP 201 or a fake queryToken string! Throw explicit 409 Conflict with recovery instructions.
+    throw new DuplicateOrderConflictError(order);
   }
 
   /**
@@ -793,7 +1149,6 @@ export class OrderService {
     orderNumberInput: unknown,
     queryTokenInput: unknown
   ): Promise<PublicOrderView> {
-    // Validate QUERY_TOKEN_PEPPER is present before lookup
     const pepper = getRequiredQueryTokenPepper();
 
     if (

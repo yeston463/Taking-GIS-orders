@@ -1,25 +1,41 @@
+import crypto from 'node:crypto';
 import type { Request, Response, NextFunction, Router } from 'express';
 import express from 'express';
 import { getAuth, DecodedIdToken } from 'firebase-admin/auth';
-import firebaseConfig from '../../firebase-applet-config.json';
 import {
   exportOrdersToCSV,
   generateOrderId,
   generateQueryToken,
+  generateClientIdempotencyKey,
 } from '../utils/order-utils.ts';
+import {
+  getFirebaseServerConfig,
+  getFirebaseAdminApp,
+  verifyFirebaseConfigConsistency,
+  getRequiredQueryTokenPepper,
+  FORBIDDEN_DEMO_UIDS,
+  getServerAdminUidWhitelist,
+  diagnoseAdminUidWhitelist,
+  resolveTrustedProxyHops,
+} from '../config/firebase-server.ts';
 import {
   OrderService,
   OrderRepository,
   createDefaultOrderService,
-  getFirebaseAdminApp,
-  verifyFirebaseConfigConsistency,
-  getRequiredQueryTokenPepper,
   DatabaseUnavailableError,
   ConfigurationError,
+  RateLimitServiceUnavailableError,
+  DuplicateOrderConflictError,
   OrderValidationError,
   OrderNotFoundError,
   hashQueryToken,
 } from './order-service.ts';
+
+export {
+  getServerAdminUidWhitelist,
+  diagnoseAdminUidWhitelist,
+  resolveTrustedProxyHops,
+};
 
 export interface VerifiedAdminIdentity {
   uid: string;
@@ -42,99 +58,12 @@ export interface ApiRouterOptions {
 
 const MAX_BODY_BYTES = 32 * 1024; // 32 KB strict request body limit
 
-const FORBIDDEN_DEMO_UIDS = new Set([
-  'admin-bootstrap-uid',
-  'demo-admin',
-  'test-admin',
-  'anonymous',
-  'root',
-]);
-
-/**
- * Returns the server-side configured ADMIN_UIDS set.
- * Never accepts email addresses or hardcoded demo UIDs.
- */
-export function getServerAdminUidWhitelist(overrideList?: string[]): Set<string> {
-  const rawList =
-    overrideList !== undefined
-      ? overrideList
-      : (process.env.ADMIN_UIDS || '')
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean);
-
-  const safeSet = new Set<string>();
-  for (const uid of rawList) {
-    if (uid && !FORBIDDEN_DEMO_UIDS.has(uid.toLowerCase()) && !uid.includes('@')) {
-      safeSet.add(uid);
-    }
-  }
-  return safeSet;
+function generateRequestId(): string {
+  return `req-${crypto.randomBytes(6).toString('hex')}`;
 }
 
 /**
- * Inspects ADMIN_UIDS configuration and returns non-sensitive diagnostics
- * (e.g., warning if ADMIN_UIDS is empty or appears to contain an email prefix instead of a 28-char Firebase UID).
- */
-export function diagnoseAdminUidWhitelist(overrideList?: string[]): {
-  configuredCount: number;
-  warnings: string[];
-} {
-  const whitelist = getServerAdminUidWhitelist(overrideList);
-  const warnings: string[] = [];
-
-  if (whitelist.size === 0) {
-    warnings.push(
-      'ADMIN_UIDS 尚未配置。请先在 /#admin 页面使用 Google 账号登录，复制界面显示的真实 Firebase UID 填入 ADMIN_UIDS。'
-    );
-  } else {
-    for (const uid of whitelist) {
-      if (uid.length < 20) {
-        warnings.push(
-          `ADMIN_UIDS 中的条目 "${uid}" 长度较短 (${uid.length} 字符)，可能为邮箱前缀而非真实的 28 位 Firebase Auth UID。若登录报 403，请以 /#admin 登录页回显的真实 UID 为准。`
-        );
-      }
-    }
-  }
-
-  return {
-    configuredCount: whitelist.size,
-    warnings,
-  };
-}
-
-/**
- * Resolves the exact number of trusted reverse-proxy hops (Requirement 6).
- * - Never unconditionally trusts X-Forwarded-For.
- * - Defaults to 1 hop ONLY when running on Cloud Run (K_SERVICE) behind Google Cloud Front End (GFE),
- *   or when TRUST_PROXY is explicitly configured ("1", "true", "cloudrun").
- * - Defaults to 0 hops (X-Forwarded-For ignored) in direct/local environments.
- */
-export function resolveTrustedProxyHops(trustProxyOption?: boolean | number): number {
-  if (typeof trustProxyOption === 'number') {
-    return Number.isInteger(trustProxyOption) && trustProxyOption > 0 ? trustProxyOption : 0;
-  }
-  if (typeof trustProxyOption === 'boolean') {
-    return trustProxyOption ? 1 : 0;
-  }
-
-  const rawEnv = (process.env.TRUST_PROXY || '').trim().toLowerCase();
-  if (rawEnv === 'false' || rawEnv === '0' || rawEnv === 'off') {
-    return 0;
-  }
-  if (/^\d+$/.test(rawEnv)) {
-    return Math.min(Math.max(parseInt(rawEnv, 10), 0), 10);
-  }
-  if (rawEnv === 'true' || rawEnv === 'cloudrun') {
-    return 1;
-  }
-
-  // Auto-detect Cloud Run GFE (1 hop) via K_SERVICE; otherwise 0 hops
-  return process.env.K_SERVICE ? 1 : 0;
-}
-
-/**
- * Safely extracts client IP according to trusted reverse proxy hop count (Requirement 6).
+ * Safely extracts client IP according to trusted reverse proxy hop count.
  * - When trustedHops === 0: completely ignores X-Forwarded-For and uses socket remoteAddress.
  * - When trustedHops >= 1: selects the IP appended by the trusted proxy from the RIGHT side
  *   of X-Forwarded-For (`parts[parts.length - trustedHops]`), preventing client spoofing of leftmost IPs.
@@ -159,10 +88,11 @@ export function getClientIp(req: Request, trustProxyOption?: boolean | number): 
 }
 
 /**
- * Returns non-sensitive runtime configuration diagnostics (Requirements 7 & 8).
+ * Returns runtime configuration diagnostics for authenticated administrators ONLY (P1-C).
+ * Sanitizes service account emails and never exposes raw secret values or raw whitelist UIDs.
  */
 export function getRuntimeConfigDiagnostics(options?: ApiRouterOptions) {
-  const firebaseConsistency = verifyFirebaseConfigConsistency();
+  const rawConsistency = verifyFirebaseConfigConsistency();
   const adminDiagnostics = diagnoseAdminUidWhitelist(options?.adminUidWhitelist);
   const trustedProxyHops = resolveTrustedProxyHops(options?.trustProxy);
 
@@ -177,7 +107,17 @@ export function getRuntimeConfigDiagnostics(options?: ApiRouterOptions) {
   }
 
   return {
-    firebaseConsistency,
+    firebaseConsistency: {
+      consistent: rawConsistency.consistent,
+      clientProjectId: rawConsistency.clientProjectId,
+      adminProjectId: rawConsistency.adminProjectId,
+      authDomainProjectId: rawConsistency.authDomainProjectId,
+      firestoreDatabaseId: rawConsistency.firestoreDatabaseId,
+      configSource: rawConsistency.configSource,
+      credentialSource: rawConsistency.credentialSource,
+      runtimeEnvironment: rawConsistency.runtimeEnvironment,
+      hasCrossProjectAdcWarning: Boolean(rawConsistency.crossProjectAdcWarning),
+    },
     queryTokenPepper: {
       configured: pepperConfigured,
       diagnostic: pepperDiagnostic,
@@ -189,14 +129,19 @@ export function getRuntimeConfigDiagnostics(options?: ApiRouterOptions) {
     },
     proxyConfig: {
       trustedProxyHops,
-      trustProxyEnv: process.env.TRUST_PROXY || null,
-      cloudRunService: process.env.K_SERVICE || null,
+      trustProxyConfigured: Boolean(process.env.TRUST_PROXY),
+      isCloudRun: Boolean(process.env.K_SERVICE),
     },
   };
 }
 
 // Universal response helper that works in both Express and Vite Connect middleware
-function sendJson(res: any, status: number, data: any) {
+function sendJson(res: any, status: number, data: any, extraHeaders: Record<string, string> = {}) {
+  Object.entries(extraHeaders).forEach(([k, v]) => {
+    if (typeof res.setHeader === 'function') {
+      res.setHeader(k, v);
+    }
+  });
   if (typeof res.status === 'function' && typeof res.json === 'function') {
     res.status(status).json(data);
   } else {
@@ -285,6 +230,7 @@ async function parseBody(req: any): Promise<any> {
 /**
  * Extracts Bearer token strictly from Authorization header.
  * Ignores x-admin-uid, x-admin-email, query parameters, and request body fields.
+ * Never logs the raw token string (P1-C).
  */
 function extractBearerToken(req: Request): string | null {
   const authHeader = req.headers.authorization;
@@ -310,6 +256,16 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
   const verifyIdTokenFn = options?.tokenVerifier || defaultTokenVerifier;
 
+  // Attach a correlation requestId to every request for safe internal log tracing (P1-C)
+  router.use((req: Request, res: Response, next: NextFunction) => {
+    const reqId = generateRequestId();
+    (req as any).requestId = reqId;
+    if (typeof res.setHeader === 'function') {
+      res.setHeader('X-Request-Id', reqId);
+    }
+    next();
+  });
+
   // Express JSON middleware with 32KB limit
   router.use(
     express.json({
@@ -319,11 +275,13 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
   );
 
   // Handle Express body-parser errors (413 Payload Too Large / 400 Bad JSON)
-  router.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  router.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    const requestId = (req as any).requestId || generateRequestId();
     if (err?.type === 'entity.too.large' || err?.status === 413) {
       sendJson(res, 413, {
         success: false,
         code: 'PAYLOAD_TOO_LARGE',
+        requestId,
         message: '请求体超过最大允许长度 (32KB)。',
       });
       return;
@@ -332,6 +290,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       sendJson(res, 400, {
         success: false,
         code: 'INVALID_JSON',
+        requestId,
         message: '请求体 JSON 格式非法。',
       });
       return;
@@ -340,16 +299,18 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
   });
 
   /**
-   * Unified Admin Authentication & Authorization Middleware (P0-A & Requirement 7)
+   * Unified Admin Authentication & Authorization Middleware (P0-A)
    * Never falls back to insecure header/email checks even when ADMIN_UIDS is unconfigured.
    */
   const requireAdminAuth = async (req: Request, res: Response, next: NextFunction) => {
+    const requestId = (req as any).requestId || generateRequestId();
     const token = extractBearerToken(req);
     if (!token) {
       sendJson(res, 401, {
         success: false,
         isAdmin: false,
         code: 'UNAUTHENTICATED',
+        requestId,
         message:
           '未提供有效的身份认证凭证 (Authorization: Bearer <ID_TOKEN>)，请先使用 Google 账号登录。',
       });
@@ -364,6 +325,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         success: false,
         isAdmin: false,
         code: 'INVALID_TOKEN',
+        requestId,
         message: 'Firebase ID Token 验证失败、已过期或签名不合法，请重新登录。',
       });
       return;
@@ -375,6 +337,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         success: false,
         isAdmin: false,
         code: 'INVALID_UID',
+        requestId,
         message: 'Token 中缺少有效用户 UID。',
       });
       return;
@@ -392,6 +355,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         success: false,
         isAdmin: false,
         code: 'FORBIDDEN_NOT_ADMIN',
+        requestId,
         uid,
         email: decoded.email || '',
         message: `当前已认证账号 (UID: ${uid}) 未获管理员权限。请在服务端环境变量 ADMIN_UIDS 中配置该真实 Firebase UID，或为账号授予 admin Custom Claim。${extraHint}`,
@@ -409,34 +373,79 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     next();
   };
 
-  // Health & non-sensitive configuration diagnostics check
+  /**
+   * Public Health Check (P1-C):
+   * Returns ONLY minimal service availability status and server timestamp.
+   * Never exposes Firebase project ID, Firestore database ID, repository driver,
+   * proxy configuration, service account emails, or admin diagnostics.
+   */
   router.get('/health', (_req: Request, res: Response) => {
-    const diagnostics = getRuntimeConfigDiagnostics(options);
     sendJson(res, 200, {
       status: 'ok',
-      firestoreDatabaseId: firebaseConfig.firestoreDatabaseId,
-      projectId: firebaseConfig.projectId,
+      service: 'geospatial-studio',
+      serverTime: new Date().toISOString(),
+    });
+  });
+
+  /**
+   * Authenticated Admin Diagnostics Endpoint (P1-C):
+   * Requires verified Firebase ID Token + Admin authorization.
+   */
+  router.get('/admin/diagnostics', requireAdminAuth, (_req: Request, res: Response) => {
+    const serverCfg = getFirebaseServerConfig();
+    const diagnostics = getRuntimeConfigDiagnostics(options);
+    sendJson(res, 200, {
+      success: true,
+      status: 'ok',
       repositoryDriver: orderService.getRepositoryDriverName(),
+      projectId: serverCfg.projectId || null,
+      firestoreDatabaseId: serverCfg.firestoreDatabaseId || null,
       diagnostics,
       serverTime: new Date().toISOString(),
     });
   });
 
-  // Public order submission with rate limiting, validation, idempotency, and authoritative DB transaction
+  // Public order submission with fail-closed rate limiting, validation, idempotency, and authoritative DB transaction
   router.post('/orders', async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     try {
       const ip = getClientIp(req, options?.trustProxy);
       const maxOrdersPerWindow = options?.orderRateLimitMax ?? 10;
-      const allowed = await orderService
-        .getRepository()
-        .checkRateLimit(`create:${ip}`, maxOrdersPerWindow, 10 * 60 * 1000);
+      const repo = orderService.getRepository();
 
-      if (!allowed) {
-        sendJson(res, 429, {
-          success: false,
-          code: 'RATE_LIMITED',
-          message: '提交过于频繁，请稍后再试或直接通过邮箱与我们联系。',
-        });
+      const rateCheck = repo.checkRateLimitDetailed
+        ? await repo.checkRateLimitDetailed(
+            `create:${ip}`,
+            maxOrdersPerWindow,
+            10 * 60 * 1000,
+            'order_create'
+          )
+        : {
+            allowed: await repo.checkRateLimit(
+              `create:${ip}`,
+              maxOrdersPerWindow,
+              10 * 60 * 1000,
+              'order_create'
+            ),
+            remaining: 0,
+            retryAfterSeconds: 60,
+            source: 'authoritative-store' as const,
+          };
+
+      if (!rateCheck.allowed) {
+        sendJson(
+          res,
+          429,
+          {
+            success: false,
+            code: 'RATE_LIMITED',
+            retryable: true,
+            retryAfterSeconds: rateCheck.retryAfterSeconds,
+            requestId,
+            message: '提交过于频繁，请稍后再试或直接通过邮箱与我们联系。',
+          },
+          { 'Retry-After': String(rateCheck.retryAfterSeconds) }
+        );
         return;
       }
 
@@ -448,19 +457,26 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
       const result = await orderService.createCustomerOrder(payload, ip, explicitIdemKey);
 
-      sendJson(res, 201, {
+      const isReplay = result.submissionStatus === 'IDEMPOTENT_REPLAY';
+      const httpStatus = isReplay ? 200 : 201;
+
+      sendJson(res, httpStatus, {
         success: true,
         orderNumber: result.orderNumber,
         queryToken: result.queryToken,
         duplicate: result.duplicate,
-        message:
-          '需求已成功提交！系统已生成唯一工单编号与专属查询凭证（仅显示一次），请立即复制保存。工程师将在 12 小时内完成技术可行性评估并与您取得联系。',
+        submissionStatus: result.submissionStatus,
+        requestId,
+        message: isReplay
+          ? '已识别为同一会话的重试提交（未重复创建新工单），已为您安全恢复该工单编号与专属查询凭证，请立即复制保存。'
+          : '需求已成功提交！系统已生成唯一工单编号与专属查询凭证（仅显示一次），请立即复制保存。工程师将在 12 小时内完成技术可行性评估并与您取得联系。',
         order: result.order,
       });
     } catch (err: any) {
       if (err instanceof PayloadTooLargeError || err instanceof InvalidJsonPayloadError) {
         sendJson(res, err.statusCode, {
           success: false,
+          requestId,
           message: err.message,
         });
         return;
@@ -469,23 +485,63 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 400, {
           success: false,
           code: 'VALIDATION_FAILED',
+          requestId,
           message: err.message,
           errors: err.errors,
         });
         return;
       }
+      if (err instanceof DuplicateOrderConflictError) {
+        // P1-A.6: Never return HTTP 201 or a fake queryToken when original token cannot be safely recovered
+        sendJson(res, 409, {
+          success: false,
+          code: err.code,
+          duplicate: true,
+          submissionStatus: 'DUPLICATE_CONFLICT_NO_TOKEN',
+          orderNumber: err.orderNumber,
+          queryToken: null,
+          order: err.order,
+          requestId,
+          message: err.recoveryInstructions,
+        });
+        return;
+      }
+      if (err instanceof RateLimitServiceUnavailableError) {
+        // P1-B: Fail-closed when rate limit backend fails
+        sendJson(
+          res,
+          503,
+          {
+            success: false,
+            code: err.code,
+            retryable: true,
+            failureCategory: err.failureCategory,
+            requestId,
+            message: err.message,
+          },
+          { 'Retry-After': '15' }
+        );
+        return;
+      }
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+        console.error(
+          `[POST /api/orders] [${requestId}] Service unavailable (${err.code}):`,
+          (err as any).internalDiagnostic || err.message
+        );
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          retryable: true,
+          requestId,
           message: err.message,
         });
         return;
       }
-      console.error('[POST /api/orders] Unexpected error:', err?.message || err);
+      console.error(`[POST /api/orders] [${requestId}] Unexpected error:`, err?.message || err);
       sendJson(res, 500, {
         success: false,
         code: 'INTERNAL_ERROR',
+        requestId,
         message: '服务器处理工单时发生异常，请稍后重试。',
       });
     }
@@ -493,19 +549,45 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
   // Public customer order status lookup (strictly requires orderNumber + high-entropy queryToken)
   router.post('/orders/lookup', async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     try {
       const ip = getClientIp(req, options?.trustProxy);
-      const maxLookupPerWindow = options?.lookupRateLimitMax ?? 20;
-      const ipAllowed = await orderService
-        .getRepository()
-        .checkRateLimit(`lookup_ip:${ip}`, maxLookupPerWindow, 10 * 60 * 1000);
+      const maxLookupPerWindow = options?.lookupRateLimitMax ?? 30;
+      const repo = orderService.getRepository();
 
-      if (!ipAllowed) {
-        sendJson(res, 429, {
-          success: false,
-          code: 'RATE_LIMITED',
-          message: '查询请求过于频繁，请稍后再试。',
-        });
+      const ipRate = repo.checkRateLimitDetailed
+        ? await repo.checkRateLimitDetailed(
+            `lookup_ip:${ip}`,
+            maxLookupPerWindow,
+            10 * 60 * 1000,
+            'order_lookup_ip'
+          )
+        : {
+            allowed: await repo.checkRateLimit(
+              `lookup_ip:${ip}`,
+              maxLookupPerWindow,
+              10 * 60 * 1000,
+              'order_lookup_ip'
+            ),
+            remaining: 0,
+            retryAfterSeconds: 60,
+            source: 'authoritative-store' as const,
+          };
+
+      if (!ipRate.allowed) {
+        sendJson(
+          res,
+          429,
+          {
+            success: false,
+            code: 'RATE_LIMITED',
+            retryable: true,
+            retryAfterSeconds: ipRate.retryAfterSeconds,
+            requestId,
+            message: '查询请求过于频繁，请稍后再试。',
+          },
+          { 'Retry-After': String(ipRate.retryAfterSeconds) }
+        );
         return;
       }
 
@@ -516,6 +598,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 400, {
           success: false,
           code: 'MISSING_LOOKUP_CREDENTIALS',
+          requestId,
           message:
             '请同时提供工单编号（如 GEO-20261029-XXXXXX）与专属查询凭证（如 QK-XXXX-XXXX-XXXX）。',
         });
@@ -524,15 +607,39 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
       // Per-order brute-force protection
       const normalizedOrderNo = String(orderNumber).trim().toUpperCase().slice(0, 32);
-      const orderAllowed = await orderService
-        .getRepository()
-        .checkRateLimit(`lookup_ord:${normalizedOrderNo}`, 10, 10 * 60 * 1000);
-      if (!orderAllowed) {
-        sendJson(res, 429, {
-          success: false,
-          code: 'ORDER_LOOKUP_LOCKED',
-          message: '该工单短时间内验证次数过多，已触发安全锁定，请 10 分钟后再试。',
-        });
+      const orderRate = repo.checkRateLimitDetailed
+        ? await repo.checkRateLimitDetailed(
+            `lookup_ord:${normalizedOrderNo}`,
+            15,
+            10 * 60 * 1000,
+            'order_lookup_target'
+          )
+        : {
+            allowed: await repo.checkRateLimit(
+              `lookup_ord:${normalizedOrderNo}`,
+              15,
+              10 * 60 * 1000,
+              'order_lookup_target'
+            ),
+            remaining: 0,
+            retryAfterSeconds: 60,
+            source: 'authoritative-store' as const,
+          };
+
+      if (!orderRate.allowed) {
+        sendJson(
+          res,
+          429,
+          {
+            success: false,
+            code: 'ORDER_LOOKUP_LOCKED',
+            retryable: true,
+            retryAfterSeconds: orderRate.retryAfterSeconds,
+            requestId,
+            message: '该工单短时间内验证次数过多，已触发安全锁定，请稍后再试。',
+          },
+          { 'Retry-After': String(orderRate.retryAfterSeconds) }
+        );
         return;
       }
 
@@ -540,12 +647,14 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
       sendJson(res, 200, {
         success: true,
+        requestId,
         order: publicOrder,
       });
     } catch (err: any) {
       if (err instanceof PayloadTooLargeError || err instanceof InvalidJsonPayloadError) {
         sendJson(res, err.statusCode, {
           success: false,
+          requestId,
           message: err.message,
         });
         return;
@@ -554,6 +663,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 400, {
           success: false,
           code: 'VALIDATION_FAILED',
+          requestId,
           message: err.message,
         });
         return;
@@ -562,22 +672,49 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 404, {
           success: false,
           code: 'LOOKUP_FAILED',
+          requestId,
           message: '工单编号或查询凭证无效，请核对后重试。',
         });
         return;
       }
+      if (err instanceof RateLimitServiceUnavailableError) {
+        sendJson(
+          res,
+          503,
+          {
+            success: false,
+            code: err.code,
+            retryable: true,
+            failureCategory: err.failureCategory,
+            requestId,
+            message: err.message,
+          },
+          { 'Retry-After': '15' }
+        );
+        return;
+      }
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+        console.error(
+          `[POST /api/orders/lookup] [${requestId}] Service unavailable (${err.code}):`,
+          (err as any).internalDiagnostic || err.message
+        );
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          retryable: true,
+          requestId,
           message: err.message,
         });
         return;
       }
-      console.error('[POST /api/orders/lookup] Unexpected error:', err?.message || err);
+      console.error(
+        `[POST /api/orders/lookup] [${requestId}] Unexpected error:`,
+        err?.message || err
+      );
       sendJson(res, 500, {
         success: false,
         code: 'INTERNAL_ERROR',
+        requestId,
         message: '查询服务暂时不可用，请稍后重试。',
       });
     }
@@ -597,7 +734,8 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
   });
 
   // Admin: Get all orders from authoritative repository
-  router.get('/admin/orders', requireAdminAuth, async (_req: Request, res: Response) => {
+  router.get('/admin/orders', requireAdminAuth, async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     try {
       const orders = await orderService.listOrdersForAdmin();
       sendJson(res, 200, {
@@ -609,12 +747,14 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          requestId,
           message: err.message,
         });
         return;
       }
       sendJson(res, 500, {
         success: false,
+        requestId,
         message: '读取工单列表失败，请检查数据库连接状态。',
       });
     }
@@ -622,6 +762,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
 
   // Admin: Update order status, manualQuote, adminNotes, or clientNotes
   router.patch('/admin/orders/:id', requireAdminAuth, async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     try {
       const { id } = req.params;
       const body = await parseBody(req);
@@ -641,6 +782,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       if (err instanceof PayloadTooLargeError || err instanceof InvalidJsonPayloadError) {
         sendJson(res, err.statusCode, {
           success: false,
+          requestId,
           message: err.message,
         });
         return;
@@ -649,6 +791,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 400, {
           success: false,
           code: 'INVALID_ORDER_UPDATE',
+          requestId,
           message: err.message,
         });
         return;
@@ -657,6 +800,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 404, {
           success: false,
           code: 'ORDER_NOT_FOUND',
+          requestId,
           message: err.message,
         });
         return;
@@ -665,12 +809,14 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          requestId,
           message: err.message,
         });
         return;
       }
       sendJson(res, 500, {
         success: false,
+        requestId,
         message: '更新工单时发生服务器错误。',
       });
     }
@@ -681,6 +827,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     '/admin/orders/:id/rotate-token',
     requireAdminAuth,
     async (req: Request, res: Response) => {
+      const requestId = (req as any).requestId || generateRequestId();
       try {
         const { id } = req.params;
         const rotated = await orderService.rotateOrderQueryTokenByAdmin(id);
@@ -697,6 +844,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
           sendJson(res, 404, {
             success: false,
             code: 'ORDER_NOT_FOUND',
+            requestId,
             message: err.message,
           });
           return;
@@ -705,12 +853,14 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
           sendJson(res, 503, {
             success: false,
             code: err.code,
+            requestId,
             message: err.message,
           });
           return;
         }
         sendJson(res, 500, {
           success: false,
+          requestId,
           message: '重置查询凭证失败。',
         });
       }
@@ -718,7 +868,8 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
   );
 
   // Admin: Export formula-sanitized CSV from authoritative repository
-  router.get('/admin/export-csv', requireAdminAuth, async (_req: Request, res: Response) => {
+  router.get('/admin/export-csv', requireAdminAuth, async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     try {
       const orders = await orderService.listOrdersForAdmin();
       const csvData = exportOrdersToCSV(orders);
@@ -731,23 +882,27 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          requestId,
           message: err.message,
         });
         return;
       }
       sendJson(res, 500, {
         success: false,
+        requestId,
         message: '导出 CSV 失败。',
       });
     }
   });
 
   // Admin: Seed demo order (strictly disabled in production per P0-B.12)
-  router.post('/admin/seed-demo', requireAdminAuth, async (_req: Request, res: Response) => {
+  router.post('/admin/seed-demo', requireAdminAuth, async (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
     if (process.env.NODE_ENV === 'production') {
       sendJson(res, 403, {
         success: false,
         code: 'DEMO_SEED_DISABLED_IN_PROD',
+        requestId,
         message: '生产环境已禁止注入演示工单。',
       });
       return;
@@ -783,7 +938,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
             createdAt: now,
             updatedAt: now,
           };
-        }, `seed-demo-${Date.now()}-${Math.random()}`);
+        }, `seed-demo-${Date.now()}-${generateClientIdempotencyKey()}`);
 
       sendJson(res, 201, {
         success: true,
@@ -796,12 +951,14 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         sendJson(res, 503, {
           success: false,
           code: err.code,
+          requestId,
           message: err.message,
         });
         return;
       }
       sendJson(res, 500, {
         success: false,
+        requestId,
         message: '生成演示工单失败。',
       });
     }

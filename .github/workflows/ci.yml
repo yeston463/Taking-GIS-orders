@@ -1,0 +1,53 @@
+name: GeoSpatial Studio CI
+
+on:
+  push:
+    branches: ["main", "master", "audit/**"]
+  pull_request:
+    branches: ["main", "master"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify-build-and-tests:
+    name: Clean Clone Build, Type Check & Isolated Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NODE_ENV: test
+      IGNORE_LOCAL_FIREBASE_CONFIG_FILE: "true"
+      FIREBASE_PROJECT_ID: demo-geospatial-studio-test
+      FIRESTORE_DATABASE_ID: ai-studio-isolated-test-db
+      FIREBASE_AUTH_DOMAIN: demo-geospatial-studio-test.firebaseapp.com
+
+    steps:
+      - name: Checkout repository (clean worktree)
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Verify no tracked secrets or untracked config imports
+        run: npm run check:secrets
+
+      - name: TypeScript type check (tsc --noEmit)
+        run: npm run lint
+
+      - name: Run unit & isolated API/security integration tests
+        run: npm test
+
+      - name: Run Firestore Security Rules static & emulator verification
+        run: npm run test:rules
+
+      - name: Build production frontend bundle
+        run: npm run build
+
+      - name: Re-scan dist bundle for leaked server secrets
+        run: npm run check:secrets

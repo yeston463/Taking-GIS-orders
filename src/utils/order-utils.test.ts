@@ -4,6 +4,9 @@ import {
   generateOrderId,
   generateOrderNumber,
   generateQueryToken,
+  generateClientIdempotencyKey,
+  getSecureRandomIndex,
+  CryptoUnavailableError,
   normalizeQueryToken,
   maskContactValue,
   toPublicOrderView,
@@ -19,7 +22,7 @@ import {
   OrderItem,
 } from './order-utils.ts';
 
-test('generateOrderNumber and generateQueryToken use CSPRNG with high-entropy formats', () => {
+test('P1-D: generateOrderNumber, generateQueryToken, and generateClientIdempotencyKey use unbiased CSPRNG and never fall back to Math.random()', () => {
   const date = new Date(2026, 9, 29);
   const num = generateOrderNumber(date);
   assert.match(num, /^GEO-20261029-[2-9A-HJ-NP-Z]{6}$/);
@@ -30,6 +33,47 @@ test('generateOrderNumber and generateQueryToken use CSPRNG with high-entropy fo
   const token = generateQueryToken();
   assert.match(token, /^QK-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}-[2-9A-HJ-NP-Z]{4}$/);
   assert.equal(normalizeQueryToken('  qk-abcd-efgh-jklm '), 'QK-ABCD-EFGH-JKLM');
+
+  const clientKey = generateClientIdempotencyKey();
+  assert.match(clientKey, /^idem_[0-9a-f]{32}$/);
+
+  // Uniqueness check across 500 generated query tokens and order numbers
+  const seenTokens = new Set<string>();
+  const seenOrderNos = new Set<string>();
+  for (let i = 0; i < 500; i++) {
+    seenTokens.add(generateQueryToken());
+    seenOrderNos.add(generateOrderNumber(date));
+  }
+  assert.equal(seenTokens.size, 500, '500 CSPRNG query tokens should have 0 collisions');
+  assert.ok(seenOrderNos.size >= 499, '500 CSPRNG 30-bit order numbers should be unique');
+
+  // Verify rejection sampling properly rejects bytes >= 256 - (256 % max)
+  // For max = 30, rejectionLimit = 256 - 16 = 240. Bytes 250, 245, 240 must be rejected, and 59 accepted (59 % 30 = 29).
+  let callCount = 0;
+  const deterministicSource = () => {
+    callCount++;
+    return new Uint8Array([250, 245, 240, 59]);
+  };
+  const sampled = getSecureRandomIndex(30, deterministicSource);
+  assert.equal(sampled, 29);
+  assert.equal(callCount, 1);
+
+  // Verify explicit failure (CryptoUnavailableError) when CSPRNG source fails or is unavailable (never falls back to Math.random)
+  const failingSource = () => {
+    throw new CryptoUnavailableError('Simulated missing Web Crypto / node:crypto');
+  };
+  assert.throws(
+    () => generateQueryToken(failingSource),
+    (err: any) => err instanceof CryptoUnavailableError && err.code === 'CSPRNG_UNAVAILABLE'
+  );
+  assert.throws(
+    () => generateOrderNumber(date, failingSource),
+    (err: any) => err instanceof CryptoUnavailableError && err.code === 'CSPRNG_UNAVAILABLE'
+  );
+  assert.throws(
+    () => generateClientIdempotencyKey(failingSource),
+    (err: any) => err instanceof CryptoUnavailableError && err.code === 'CSPRNG_UNAVAILABLE'
+  );
 });
 
 test('maskContactValue masks emails and WeChat IDs to protect customer privacy', () => {

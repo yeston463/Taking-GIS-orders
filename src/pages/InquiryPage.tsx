@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import {
   FileText,
   Send,
@@ -9,6 +9,7 @@ import {
   Clock,
   Search,
   KeyRound,
+  RefreshCw,
 } from 'lucide-react';
 import {
   ServiceType,
@@ -16,11 +17,48 @@ import {
   SERVICE_STARTING_PRICES,
   validateOrderInput,
   OrderInputPayload,
+  generateClientIdempotencyKey,
+  PublicOrderView,
 } from '../utils/order-utils.ts';
 
 interface InquiryPageProps {
   initialService?: ServiceType;
   onGoToLookup: (orderNumber: string, queryToken: string) => void;
+}
+
+const SESSION_IDEM_STORAGE_KEY = 'geospatial_active_idem_v3';
+
+function getOrCreateDraftIdempotencyKey(draftSignature: string): string {
+  try {
+    const raw = sessionStorage.getItem(SESSION_IDEM_STORAGE_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (
+        parsed &&
+        parsed.signature === draftSignature &&
+        typeof parsed.key === 'string' &&
+        parsed.key.length >= 16
+      ) {
+        return parsed.key;
+      }
+    }
+    const freshKey = generateClientIdempotencyKey();
+    sessionStorage.setItem(
+      SESSION_IDEM_STORAGE_KEY,
+      JSON.stringify({ signature: draftSignature, key: freshKey, createdAt: Date.now() })
+    );
+    return freshKey;
+  } catch {
+    return generateClientIdempotencyKey();
+  }
+}
+
+function clearDraftIdempotencyKey(): void {
+  try {
+    sessionStorage.removeItem(SESSION_IDEM_STORAGE_KEY);
+  } catch {
+    // Ignore storage errors in private browsing
+  }
 }
 
 export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoToLookup }) => {
@@ -44,15 +82,33 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
   const [submitSuccess, setSubmitSuccess] = useState<{
     orderNumber: string;
     queryToken: string;
+    duplicate: boolean;
+    submissionStatus: 'CREATED' | 'IDEMPOTENT_REPLAY';
     message: string;
   } | null>(null);
+  const [duplicateConflict, setDuplicateConflict] = useState<{
+    orderNumber: string;
+    message: string;
+    order?: PublicOrderView;
+  } | null>(null);
   const [copiedField, setCopiedField] = useState<'order' | 'token' | 'both' | null>(null);
+  const inFlightIdemKeyRef = useRef<string | null>(null);
 
   useEffect(() => {
     if (initialService) {
       setFormData((prev) => ({ ...prev, serviceType: initialService }));
     }
   }, [initialService]);
+
+  const computeDraftSignature = (data: OrderInputPayload): string => {
+    return [
+      data.serviceType,
+      data.title.trim(),
+      data.description.trim(),
+      data.contactMethod,
+      data.contactValue.trim().toLowerCase(),
+    ].join('|');
+  };
 
   const handleChange = (
     e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>
@@ -64,6 +120,7 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
     } else {
       setFormData((prev) => ({ ...prev, [name]: value }));
     }
+    inFlightIdemKeyRef.current = null;
     if (errors[name]) {
       setErrors((prev) => {
         const next = { ...prev };
@@ -73,9 +130,9 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
     }
   };
 
-  const handleSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const executeOrderSubmit = async (forceNewOrder = false) => {
     setSubmitError(null);
+    setDuplicateConflict(null);
 
     const validation = validateOrderInput(formData);
     if (!validation.valid) {
@@ -86,13 +143,42 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
     setIsSubmitting(true);
 
     try {
+      const draftSig = computeDraftSignature(formData);
+      let idemKey: string;
+      if (forceNewOrder) {
+        clearDraftIdempotencyKey();
+        idemKey = generateClientIdempotencyKey();
+        inFlightIdemKeyRef.current = idemKey;
+      } else {
+        idemKey = inFlightIdemKeyRef.current || getOrCreateDraftIdempotencyKey(draftSig);
+        inFlightIdemKeyRef.current = idemKey;
+      }
+
       const response = await fetch('/api/orders', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(formData),
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Idempotency-Key': idemKey,
+        },
+        body: JSON.stringify({
+          ...formData,
+          forceNewOrder,
+        }),
       });
 
       const data = await response.json();
+
+      if (
+        response.status === 409 &&
+        data.code === 'DUPLICATE_SUBMISSION_REQUIRES_MANUAL_RECOVERY'
+      ) {
+        setDuplicateConflict({
+          orderNumber: data.orderNumber,
+          message: data.message,
+          order: data.order,
+        });
+        return;
+      }
 
       if (!response.ok || !data.success) {
         if (data.errors && typeof data.errors === 'object') {
@@ -104,13 +190,21 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
       setSubmitSuccess({
         orderNumber: data.orderNumber,
         queryToken: data.queryToken,
+        duplicate: Boolean(data.duplicate),
+        submissionStatus:
+          data.submissionStatus === 'IDEMPOTENT_REPLAY' ? 'IDEMPOTENT_REPLAY' : 'CREATED',
         message: data.message,
       });
     } catch (err: any) {
-      setSubmitError(err.message || '网络连接或服务器异常，请重试');
+      setSubmitError(err.message || '网络连接或服务器异常，请重试（您的会话幂等密钥已保留，可直接点击重试）');
     } finally {
       setIsSubmitting(false);
     }
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await executeOrderSubmit(false);
   };
 
   const handleCopyText = (text: string, field: 'order' | 'token' | 'both') => {
@@ -135,14 +229,27 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
       </div>
 
       {submitSuccess ? (
-        /* Success Card */
-        <div className="bg-white rounded-3xl border border-teal-500/40 p-8 shadow-xl text-center space-y-6 animate-fadeIn">
+        /* Success / Idempotent Replay Card (P1-A.7: explicitly distinguishes new order vs duplicate replay) */
+        <div
+          data-testid="order-submit-result-card"
+          data-submission-status={submitSuccess.submissionStatus}
+          className="bg-white rounded-3xl border border-teal-500/40 p-8 shadow-xl text-center space-y-6 animate-fadeIn"
+        >
           <div className="w-16 h-16 rounded-2xl bg-teal-50 border border-teal-200 text-teal-600 mx-auto flex items-center justify-center">
             <CheckCircle className="w-8 h-8" />
           </div>
 
           <div className="space-y-2">
-            <h2 className="text-2xl font-bold text-slate-900">需求已成功提交登记！</h2>
+            <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-bold border bg-teal-50 border-teal-300 text-teal-800">
+              {submitSuccess.duplicate
+                ? '重复提交已识别 · 已为您安全恢复原工单凭证'
+                : '新订单创建成功'}
+            </div>
+            <h2 className="text-2xl font-bold text-slate-900">
+              {submitSuccess.duplicate
+                ? '已识别为同一会话的重复提交（未重复建单）'
+                : '需求已成功提交登记！'}
+            </h2>
             <p className="text-xs sm:text-sm text-slate-600 max-w-md mx-auto">{submitSuccess.message}</p>
           </div>
 
@@ -204,7 +311,7 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
 
             <p className="text-[11px] text-amber-300 leading-relaxed bg-amber-500/10 border border-amber-500/20 rounded-lg p-2.5">
               安全提示：为保护您的客户隐私与报价信息，服务端仅存储查询凭证的加密哈希值，
-              <strong>专属查询凭证仅在此页面显示一次</strong>
+              <strong>专属查询凭证不在数据库保存明文</strong>
               。后续查询工单状态必须同时输入「工单编号 + 专属查询凭证」。
             </p>
           </div>
@@ -236,7 +343,10 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
             </button>
             <button
               onClick={() => {
+                clearDraftIdempotencyKey();
+                inFlightIdemKeyRef.current = null;
                 setSubmitSuccess(null);
+                setDuplicateConflict(null);
                 setFormData({
                   serviceType: 'thematic_map',
                   title: '',
@@ -263,6 +373,34 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
           onSubmit={handleSubmit}
           className="bg-white rounded-3xl border border-slate-200 p-6 sm:p-10 shadow-sm space-y-8"
         >
+          {duplicateConflict && (
+            <div
+              data-testid="duplicate-conflict-banner"
+              className="bg-amber-50 border border-amber-300 rounded-2xl p-5 space-y-3 text-amber-950 text-xs"
+            >
+              <div className="flex items-start gap-2.5">
+                <AlertCircle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1.5">
+                  <strong className="block text-sm font-bold text-amber-900">
+                    重复提交已识别（工单号：{duplicateConflict.orderNumber}）
+                  </strong>
+                  <p className="leading-relaxed text-amber-800">{duplicateConflict.message}</p>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-3 pt-1 pl-7">
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={() => executeOrderSubmit(true)}
+                  className="px-4 py-2 rounded-xl bg-amber-700 hover:bg-amber-800 text-white font-semibold text-xs transition cursor-pointer flex items-center gap-1.5"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>确认这是另一笔独立新委托，继续创建新工单</span>
+                </button>
+              </div>
+            </div>
+          )}
+
           {submitError && (
             <div className="bg-red-50 border border-red-200 rounded-xl p-4 flex items-start gap-3 text-red-800 text-xs">
               <AlertCircle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />

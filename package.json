@@ -8,6 +8,8 @@
     "build": "vite build",
     "start": "tsx server.ts",
     "test": "npx --yes tsx --test src/utils/order-utils.test.ts src/tests/api-and-security.test.ts",
+    "test:rules": "npx --yes tsx --test src/tests/firestore-rules.emulator.test.ts",
+    "check:secrets": "npx --yes tsx scripts/check-secrets.ts",
     "migrate:check": "tsx scripts/migrate-orders.ts",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
