@@ -1,0 +1,14 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+.data/
+.playwright-cli/
+firebase-applet-config.json
+firebase-AccountKey*.json
+serviceAccountKey*.json
+public/assets/aistudio/

@@ -1,0 +1,149 @@
+{
+  "entities": {
+    "Order": {
+      "title": "Order",
+      "description": "GIS Service Order and inquiry record",
+      "type": "object",
+      "properties": {
+        "orderNumber": {
+          "type": "string",
+          "description": "Readable order tracking code",
+          "maxLength": 32,
+          "pattern": "^GEO-[0-9]{8}-[A-Z0-9]{4,6}$"
+        },
+        "serviceType": {
+          "type": "string",
+          "description": "Type of GIS service requested",
+          "enum": [
+            "thematic_map",
+            "spatial_processing",
+            "script_dev",
+            "webgis_dev",
+            "remote_sensing"
+          ]
+        },
+        "title": {
+          "type": "string",
+          "description": "Brief summary of request",
+          "maxLength": 100,
+          "minLength": 2
+        },
+        "description": {
+          "type": "string",
+          "description": "Detailed requirements",
+          "maxLength": 2000,
+          "minLength": 5
+        },
+        "studyArea": {
+          "type": "string",
+          "description": "Geographical study extent",
+          "maxLength": 120
+        },
+        "dataFormats": {
+          "type": "string",
+          "description": "Input and output data format preferences",
+          "maxLength": 200
+        },
+        "budgetRange": {
+          "type": "string",
+          "description": "Client budget range in CNY",
+          "maxLength": 60
+        },
+        "expectedDeliveryDate": {
+          "type": "string",
+          "description": "Expected delivery date YYYY-MM-DD",
+          "maxLength": 30
+        },
+        "contactMethod": {
+          "type": "string",
+          "description": "Contact medium",
+          "enum": ["email", "wechat"]
+        },
+        "contactValue": {
+          "type": "string",
+          "description": "Email address or WeChat ID",
+          "maxLength": 120,
+          "minLength": 3
+        },
+        "status": {
+          "type": "string",
+          "description": "Current order lifecycle status",
+          "enum": [
+            "pending_review",
+            "pending_quote",
+            "pending_payment",
+            "in_progress",
+            "pending_acceptance",
+            "completed",
+            "cancelled"
+          ]
+        },
+        "manualQuote": {
+          "type": "number",
+          "description": "Manual price quote in CNY"
+        },
+        "adminNotes": {
+          "type": "string",
+          "description": "Internal remarks visible only to studio admin",
+          "maxLength": 2000
+        },
+        "clientNotes": {
+          "type": "string",
+          "description": "Public status notes communicated to client",
+          "maxLength": 1000
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Creation timestamp ISO string"
+        },
+        "updatedAt": {
+          "type": "string",
+          "description": "Last update timestamp ISO string"
+        }
+      },
+      "required": [
+        "orderNumber",
+        "serviceType",
+        "title",
+        "description",
+        "contactMethod",
+        "contactValue",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "AdminUser": {
+      "title": "AdminUser",
+      "description": "Studio administrator profile and privilege document",
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "description": "Administrator email address",
+          "maxLength": 120
+        },
+        "role": {
+          "type": "string",
+          "description": "Role string",
+          "enum": ["admin", "superadmin"]
+        },
+        "createdAt": {
+          "type": "string",
+          "description": "Registration timestamp"
+        }
+      },
+      "required": ["email", "role"]
+    }
+  },
+  "firestore": {
+    "/orders/{orderId}": {
+      "schema": "Order",
+      "description": "Customer GIS service orders collection. Only accessible by authorized studio admins; public creation and queries handled via rate-limited backend API."
+    },
+    "/admins/{uid}": {
+      "schema": "AdminUser",
+      "description": "System administrator records. Strict privilege checks based on verified Google authentication and whitelist."
+    }
+  }
+}
