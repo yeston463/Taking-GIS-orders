@@ -232,7 +232,7 @@ test('[MOCK_AUTH_VERIFIER] Cases 1-5: Admin Authentication & Adversarial Bypass 
     assert.equal(body4.code, 'FORBIDDEN_NOT_ADMIN');
     assert.equal(body4.uid, NON_ADMIN_UID);
 
-    // Case 5: Valid whitelisted Admin UID Bearer Token -> 200
+    // Case 5: Valid whitelisted Admin UID Bearer Token (both Authorization and X-Firebase-Auth) -> 200
     const res5 = await fetch(`${srv.baseUrl}/api/admin/orders`, {
       headers: {
         Authorization: 'Bearer valid-admin-jwt',
@@ -241,6 +241,19 @@ test('[MOCK_AUTH_VERIFIER] Cases 1-5: Admin Authentication & Adversarial Bypass 
     assert.equal(res5.status, 200);
     const body5 = await res5.json();
     assert.equal(body5.success, true);
+
+    const res5CustomHeader = await fetch(`${srv.baseUrl}/api/admin/verify`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Firebase-Auth': 'Bearer valid-admin-jwt',
+      },
+      body: JSON.stringify({}),
+    });
+    assert.equal(res5CustomHeader.status, 200);
+    const body5CustomHeader = await res5CustomHeader.json();
+    assert.equal(body5CustomHeader.isAdmin, true);
+    assert.equal(body5CustomHeader.uid, ADMIN_UID);
   } finally {
     await srv.close();
     if (fs.existsSync(tmpFile)) fs.unlinkSync(tmpFile);

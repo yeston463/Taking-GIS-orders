@@ -228,12 +228,19 @@ async function parseBody(req: any): Promise<any> {
 }
 
 /**
- * Extracts Bearer token strictly from Authorization header.
+ * Extracts Bearer token strictly from X-Firebase-Auth or Authorization header.
+ * Using X-Firebase-Auth from browser clients prevents Google Cloud Run / GFE ingress
+ * proxies (*.run.app) from intercepting the Authorization header as a Cloud Run IAM OIDC token
+ * and returning an HTML 401 page (`<html><head>...`).
  * Ignores x-admin-uid, x-admin-email, query parameters, and request body fields.
  * Never logs the raw token string (P1-C).
  */
 function extractBearerToken(req: Request): string | null {
-  const authHeader = req.headers.authorization;
+  const customHeader = req.headers['x-firebase-auth'];
+  const authHeader =
+    typeof customHeader === 'string' && customHeader.trim().length > 0
+      ? customHeader
+      : req.headers.authorization;
   if (!authHeader || typeof authHeader !== 'string') {
     return null;
   }

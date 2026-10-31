@@ -3,8 +3,11 @@ import {
   getAuth,
   GoogleAuthProvider,
   signInWithPopup,
+  signInWithRedirect,
+  getRedirectResult,
   signOut,
   type Auth,
+  type User,
 } from 'firebase/auth';
 import {
   getFirebaseClientConfig,
@@ -34,8 +37,32 @@ export function getFirebaseAuth(): Auth | null {
 
 export const auth = getFirebaseAuth();
 export const googleProvider = new GoogleAuthProvider();
+googleProvider.setCustomParameters({ prompt: 'select_account' });
 
-export async function signInAdminWithGoogle() {
+export interface FormattedAuthError extends Error {
+  code?: string;
+}
+
+export function formatFirebaseAuthError(err: any): FormattedAuthError {
+  const code = typeof err?.code === 'string' ? err.code : '';
+  const currentHost = typeof window !== 'undefined' ? window.location.hostname : '';
+  let message = err?.message || 'Google 登录未完成或被取消';
+
+  if (code === 'auth/popup-blocked') {
+    message =
+      '浏览器拦截了 Google 登录弹窗（或当前处于内嵌预览窗口限制中）。请点击浏览器地址栏右侧的“允许弹窗”图标后重试，或点击下方按钮在独立新标签页中打开管理后台登录。';
+  } else if (code === 'auth/popup-closed-by-user' || code === 'auth/cancelled-popup-request') {
+    message = 'Google 登录窗口已关闭，登录未完成。请重新点击登录按钮。';
+  } else if (code === 'auth/unauthorized-domain') {
+    message = `当前访问域名 (${currentHost}) 尚未加入 Firebase Authentication 授权域名列表。请前往 Firebase Console → Authentication → Settings → Authorized domains 添加 "${currentHost}"。`;
+  }
+
+  const formatted: FormattedAuthError = new Error(message);
+  formatted.code = code;
+  return formatted;
+}
+
+export async function signInAdminWithGoogle(): Promise<User> {
   const check = validateFirebaseClientConfig();
   const currentAuth = getFirebaseAuth();
   if (!currentAuth) {
@@ -47,8 +74,33 @@ export async function signInAdminWithGoogle() {
     const result = await signInWithPopup(currentAuth, googleProvider);
     return result.user;
   } catch (err: any) {
-    console.error('Google Sign In failed:', err?.code || err?.message);
-    throw err;
+    throw formatFirebaseAuthError(err);
+  }
+}
+
+export async function signInAdminWithGoogleRedirect(): Promise<void> {
+  const check = validateFirebaseClientConfig();
+  const currentAuth = getFirebaseAuth();
+  if (!currentAuth) {
+    throw new Error(
+      `尚未完整配置前端 Firebase 客户端参数（缺少: ${check.missingFields.join(', ')}）。`
+    );
+  }
+  try {
+    await signInWithRedirect(currentAuth, googleProvider);
+  } catch (err: any) {
+    throw formatFirebaseAuthError(err);
+  }
+}
+
+export async function resolveGoogleRedirectResult(): Promise<User | null> {
+  const currentAuth = getFirebaseAuth();
+  if (!currentAuth) return null;
+  try {
+    const result = await getRedirectResult(currentAuth);
+    return result?.user ?? null;
+  } catch (err: any) {
+    throw formatFirebaseAuthError(err);
   }
 }
 

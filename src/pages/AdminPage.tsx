@@ -10,10 +10,13 @@ import {
   AlertCircle,
   RefreshCw,
   KeyRound,
+  ExternalLink,
 } from 'lucide-react';
 import {
   auth,
   signInAdminWithGoogle,
+  signInAdminWithGoogleRedirect,
+  resolveGoogleRedirectResult,
   logoutAdmin,
   getAdminBearerToken,
 } from '../lib/firebase.ts';
@@ -34,7 +37,14 @@ export const AdminPage: React.FC = () => {
   const [isAdmin, setIsAdmin] = useState(false);
   const [authChecking, setAuthChecking] = useState(true);
   const [authError, setAuthError] = useState<string | null>(null);
+  const [authErrorCode, setAuthErrorCode] = useState<string | null>(null);
   const [unwhitelistedUid, setUnwhitelistedUid] = useState<string | null>(null);
+  const isEmbeddedIframe =
+    typeof window !== 'undefined' && window.self !== window.top;
+  const standaloneAdminUrl =
+    typeof window !== 'undefined'
+      ? `${window.location.origin}${window.location.pathname}#admin`
+      : '#admin';
 
   const [orders, setOrders] = useState<OrderItem[]>([]);
   const [isLoadingOrders, setIsLoadingOrders] = useState(false);
@@ -68,7 +78,7 @@ export const AdminPage: React.FC = () => {
   const [rotatedTokenResult, setRotatedTokenResult] = useState<string | null>(null);
   const [copiedRotatedToken, setCopiedRotatedToken] = useState(false);
 
-  // Listen to Firebase Auth state
+  // Listen to Firebase Auth state & resolve redirect sign-in results
   useEffect(() => {
     if (!auth) {
       setCurrentUser(null);
@@ -76,6 +86,14 @@ export const AdminPage: React.FC = () => {
       setAuthChecking(false);
       return;
     }
+
+    resolveGoogleRedirectResult().catch((err: any) => {
+      if (err?.message) {
+        setAuthError(err.message);
+        setAuthErrorCode(err.code || null);
+      }
+    });
+
     const unsubscribe = auth.onAuthStateChanged(async (user) => {
       setAuthChecking(true);
       setUnwhitelistedUid(null);
@@ -92,6 +110,17 @@ export const AdminPage: React.FC = () => {
     return () => unsubscribe();
   }, []);
 
+  const parseJsonResponse = async (res: Response): Promise<any> => {
+    const rawText = await res.text();
+    try {
+      return rawText ? JSON.parse(rawText) : {};
+    } catch {
+      throw new Error(
+        `服务端或反向代理返回了非 JSON 响应 (HTTP ${res.status})。请刷新页面后重试。`
+      );
+    }
+  };
+
   const verifyAdminPrivilegeWithBearerToken = async () => {
     setAuthError(null);
     setUnwhitelistedUid(null);
@@ -107,24 +136,29 @@ export const AdminPage: React.FC = () => {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
+          'X-Firebase-Auth': `Bearer ${idToken}`,
         },
+        body: JSON.stringify({}),
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
 
       if (res.ok && data.isAdmin) {
         setIsAdmin(true);
         await fetchOrdersFromServer();
       } else {
         setIsAdmin(false);
-        if (res.status === 403 && data.uid) {
-          setUnwhitelistedUid(data.uid);
+        const detectedUid = data.uid || auth?.currentUser?.uid || null;
+        if (detectedUid) {
+          setUnwhitelistedUid(detectedUid);
         }
         setAuthError(
           data.message || '当前已认证账号未在服务端 ADMIN_UIDS 白名单内，且无 admin Custom Claim。'
         );
       }
     } catch (err: any) {
+      if (auth?.currentUser?.uid) {
+        setUnwhitelistedUid(auth.currentUser.uid);
+      }
       setAuthError('服务端权限校验异常：' + (err.message || '网络错误'));
       setIsAdmin(false);
     } finally {
@@ -134,13 +168,26 @@ export const AdminPage: React.FC = () => {
 
   const handleGoogleLogin = async () => {
     setAuthError(null);
+    setAuthErrorCode(null);
     try {
       const user = await signInAdminWithGoogle();
       if (user) {
         await verifyAdminPrivilegeWithBearerToken();
       }
     } catch (err: any) {
+      setAuthErrorCode(err?.code || null);
       setAuthError(err.message || 'Google 登录未完成或被取消');
+    }
+  };
+
+  const handleGoogleRedirectLogin = async () => {
+    setAuthError(null);
+    setAuthErrorCode(null);
+    try {
+      await signInAdminWithGoogleRedirect();
+    } catch (err: any) {
+      setAuthErrorCode(err?.code || null);
+      setAuthError(err.message || '页面重定向登录启动失败');
     }
   };
 
@@ -163,10 +210,10 @@ export const AdminPage: React.FC = () => {
 
       const res = await fetch('/api/admin/orders', {
         headers: {
-          Authorization: `Bearer ${idToken}`,
+          'X-Firebase-Auth': `Bearer ${idToken}`,
         },
       });
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
 
       if (!res.ok || !data.success) {
         throw new Error(data.message || `读取工单失败 (HTTP ${res.status})`);
@@ -245,12 +292,12 @@ export const AdminPage: React.FC = () => {
         method: 'PATCH',
         headers: {
           'Content-Type': 'application/json',
-          Authorization: `Bearer ${idToken}`,
+          'X-Firebase-Auth': `Bearer ${idToken}`,
         },
         body: JSON.stringify(payload),
       });
 
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (!res.ok || !data.success) {
         throw new Error(data.message || '更新工单失败');
       }
@@ -288,11 +335,13 @@ export const AdminPage: React.FC = () => {
         {
           method: 'POST',
           headers: {
-            Authorization: `Bearer ${idToken}`,
+            'Content-Type': 'application/json',
+            'X-Firebase-Auth': `Bearer ${idToken}`,
           },
+          body: JSON.stringify({}),
         }
       );
-      const data = await res.json();
+      const data = await parseJsonResponse(res);
       if (!res.ok || !data.success) {
         throw new Error(data.message || '重置查询凭证失败');
       }
@@ -404,12 +453,14 @@ export const AdminPage: React.FC = () => {
                 <ShieldAlert className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
                 <span>{authError}</span>
               </div>
-              {unwhitelistedUid && (
+              {(unwhitelistedUid || currentUser?.uid) && (
                 <div className="bg-white border border-red-200 rounded-lg p-2.5 font-mono text-[11px] text-slate-800 flex items-center justify-between gap-2">
-                  <span className="truncate">您的真实 UID: {unwhitelistedUid}</span>
+                  <span className="truncate">
+                    您的真实 UID: {unwhitelistedUid || currentUser?.uid}
+                  </span>
                   <button
                     type="button"
-                    onClick={() => handleCopy(unwhitelistedUid)}
+                    onClick={() => handleCopy(unwhitelistedUid || currentUser?.uid)}
                     className="px-2 py-0.5 rounded bg-slate-100 hover:bg-slate-200 text-slate-700 text-[10px] shrink-0 cursor-pointer"
                   >
                     {copiedText ? '已复制' : '复制 UID'}
@@ -445,6 +496,35 @@ export const AdminPage: React.FC = () => {
               </svg>
               <span>使用 Google 账号安全登录</span>
             </button>
+
+            {!isEmbeddedIframe && authErrorCode === 'auth/popup-blocked' && (
+              <button
+                type="button"
+                onClick={handleGoogleRedirectLogin}
+                className="w-full py-2.5 rounded-xl bg-teal-600 hover:bg-teal-700 text-white font-semibold text-xs transition cursor-pointer flex items-center justify-center gap-2 shadow-sm"
+              >
+                <span>使用当前页面跳转登录（免弹窗）</span>
+              </button>
+            )}
+
+            {(isEmbeddedIframe || authErrorCode === 'auth/popup-blocked') && (
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 text-left space-y-2">
+                <p className="text-[11px] text-slate-600 leading-relaxed">
+                  {authErrorCode === 'auth/popup-blocked'
+                    ? '检测到浏览器或预览内嵌框拦截了登录弹窗。您可以点击浏览器地址栏右侧图标允许弹窗，或直接在独立标签页中打开管理后台完成登录：'
+                    : '提示：若在 AI Studio 预览框内遇到浏览器拦截 Google 登录弹窗，可在独立浏览器标签页中打开本后台进行登录与管理：'}
+                </p>
+                <a
+                  href={standaloneAdminUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="w-full py-2.5 px-3 rounded-lg bg-white hover:bg-slate-100 border border-slate-300 text-slate-800 font-semibold text-xs transition flex items-center justify-center gap-1.5 shadow-2xs"
+                >
+                  <ExternalLink className="w-3.5 h-3.5 text-teal-600" />
+                  <span>在独立新标签页中打开管理后台 (#admin)</span>
+                </a>
+              </div>
+            )}
 
             {currentUser && !isAdmin && (
               <button

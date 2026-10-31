@@ -61,7 +61,12 @@ export const LookupPage: React.FC<LookupPageProps> = ({
         }),
       });
 
-      const data = await res.json();
+      let data: any;
+      try {
+        data = await res.json();
+      } catch {
+        throw new Error(`服务端返回了非 JSON 响应 (HTTP ${res.status})，请刷新页面后重试。`);
+      }
 
       if (!res.ok || !data.success) {
         throw new Error(data.message || '工单编号或查询凭证无效，请核对后重试。');

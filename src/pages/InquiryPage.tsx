@@ -166,7 +166,12 @@ export const InquiryPage: React.FC<InquiryPageProps> = ({ initialService, onGoTo
         }),
       });
 
-      const data = await response.json();
+      let data: any;
+      try {
+        data = await response.json();
+      } catch {
+        throw new Error(`服务端返回了非 JSON 响应 (HTTP ${response.status})，请刷新页面后重试。`);
+      }
 
       if (
         response.status === 409 &&

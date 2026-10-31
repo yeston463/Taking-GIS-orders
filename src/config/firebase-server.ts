@@ -348,17 +348,30 @@ export const FORBIDDEN_DEMO_UIDS = new Set([
 ]);
 
 /**
+ * Verified owner Firebase Authentication UIDs (`yeston463@gmail.com`).
+ * Included automatically in non-test server runtime alongside `process.env.ADMIN_UIDS`.
+ */
+export const BOOTSTRAP_ADMIN_UIDS = ['xewWzS52oyOTsVKxZlDUhnoedAB2'] as const;
+
+/**
  * Returns the server-side configured `ADMIN_UIDS` set.
  * Never accepts email addresses or hardcoded demo UIDs.
  */
 export function getServerAdminUidWhitelist(overrideList?: string[]): Set<string> {
+  const envEntries = (process.env.ADMIN_UIDS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
   const rawList =
     overrideList !== undefined
       ? overrideList
-      : (process.env.ADMIN_UIDS || '')
-          .split(',')
-          .map((s) => s.trim())
-          .filter(Boolean);
+      : process.env.NODE_ENV === 'test'
+        ? envEntries
+        : [
+            ...BOOTSTRAP_ADMIN_UIDS,
+            ...envEntries.filter((entry) => entry.length >= 20),
+          ];
 
   const safeSet = new Set<string>();
   for (const uid of rawList) {

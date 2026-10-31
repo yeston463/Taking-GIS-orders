@@ -37,9 +37,51 @@ export interface FirebaseClientValidationResult {
   config: FirebaseClientConfig;
 }
 
-function readEnvString(key: string): string {
+function readStaticViteEnv(key: string): string {
   try {
-    const metaEnv = (import.meta as any)?.env;
+    switch (key) {
+      case 'VITE_FIREBASE_PROJECT_ID':
+        return String(import.meta.env.VITE_FIREBASE_PROJECT_ID || '').trim();
+      case 'VITE_FIREBASE_API_KEY':
+        return String(import.meta.env.VITE_FIREBASE_API_KEY || '').trim();
+      case 'VITE_FIREBASE_APP_ID':
+        return String(import.meta.env.VITE_FIREBASE_APP_ID || '').trim();
+      case 'VITE_FIREBASE_AUTH_DOMAIN':
+        return String(import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || '').trim();
+      case 'VITE_FIREBASE_DATABASE_ID':
+        return String(import.meta.env.VITE_FIREBASE_DATABASE_ID || '').trim();
+      default:
+        return '';
+    }
+  } catch {
+    return '';
+  }
+}
+
+function readEnvString(key: string): string {
+  // In Node test environment, allow runtime process.env overrides to take precedence
+  try {
+    if (
+      typeof process !== 'undefined' &&
+      process.env &&
+      process.env.NODE_ENV === 'test' &&
+      typeof process.env[key] === 'string' &&
+      process.env[key]!.trim() !== ''
+    ) {
+      return process.env[key]!.trim();
+    }
+  } catch {
+    // Ignore in browser runtimes
+  }
+
+  // Static property access ensures Vite replaces `import.meta.env.VITE_*` in both dev and production builds
+  const staticVal = readStaticViteEnv(key);
+  if (staticVal !== '') {
+    return staticVal;
+  }
+
+  try {
+    const metaEnv = (import.meta as any).env;
     if (metaEnv && typeof metaEnv[key] === 'string' && metaEnv[key].trim() !== '') {
       return metaEnv[key].trim();
     }
