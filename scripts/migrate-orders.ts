@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { pathToFileURL } from 'node:url';
 import { OrderItem, cleanOrderForFirestore, generateQueryToken } from '../src/utils/order-utils.ts';
 import {
   createDefaultOrderService,
@@ -137,8 +138,8 @@ export async function analyzeLocalOrdersMigration(
   };
 }
 
-// CLI entry point
-if (import.meta.url === `file://${process.argv[1]}`) {
+// CLI entry point (pathToFileURL keeps this guard working on Windows and POSIX)
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const args = new Set(process.argv.slice(2));
   const shouldExecute = args.has('--execute') && args.has('--approve');
 
@@ -178,6 +179,72 @@ if (import.meta.url === `file://${process.argv[1]}`) {
       if (summary.realRecordsCount === 0) {
         console.log('\n没有需要迁移的真实客户工单（全部为 Demo 种子数据）。');
         return;
+      }
+
+      if (summary.duplicateOrderNumbersInSource.length > 0) {
+        console.error('\n源文件存在重复工单号，已拒绝执行迁移。请先人工合并重复记录。');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (!summary.targetReachable) {
+        console.error(
+          `\n目标数据库不可达，已拒绝执行迁移：${summary.targetError || '未知错误'}`
+        );
+        process.exitCode = 1;
+        return;
+      }
+
+      const rawSource = JSON.parse(fs.readFileSync(summary.sourceFile, 'utf-8'));
+      if (!Array.isArray(rawSource)) {
+        console.error('\n源文件格式非法：预期为工单数组，已拒绝执行迁移。');
+        process.exitCode = 1;
+        return;
+      }
+      const recordsByNumber = new Map<string, OrderItem>();
+      for (const rec of rawSource as OrderItem[]) {
+        recordsByNumber.set(String(rec.orderNumber || '').trim().toUpperCase(), rec);
+      }
+
+      const service = createDefaultOrderService();
+      const repo = service.getRepository();
+      let created = 0;
+      let updated = 0;
+      let skipped = 0;
+      let failed = 0;
+
+      for (const candidate of summary.candidates) {
+        if (candidate.classification !== 'REAL_CUSTOMER') continue;
+        if (candidate.action === 'CONFLICT_OLDER_OR_EQUAL') {
+          skipped++;
+          console.log(`SKIP   ${candidate.orderNumber} (目标已有相同或更新版本)`);
+          continue;
+        }
+
+        const record = recordsByNumber.get(candidate.orderNumber.toUpperCase());
+        if (!record) {
+          failed++;
+          console.error(`FAILED ${candidate.orderNumber} (源记录缺失)`);
+          continue;
+        }
+
+        try {
+          const result = await repo.importOrderAtomic(record, 'if-newer');
+          if (result === 'created') created++;
+          else if (result === 'updated') updated++;
+          else skipped++;
+          console.log(`${result.toUpperCase().padEnd(6)} ${candidate.orderNumber}`);
+        } catch (err: any) {
+          failed++;
+          console.error(`FAILED ${candidate.orderNumber}: ${err?.message || err}`);
+        }
+      }
+
+      console.log(
+        `\n迁移完成：新增 ${created}，更新 ${updated}，跳过 ${skipped}，失败 ${failed}。`
+      );
+      if (failed > 0) {
+        process.exitCode = 1;
       }
     })
     .catch((err) => {

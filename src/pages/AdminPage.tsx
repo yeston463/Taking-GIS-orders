@@ -29,7 +29,6 @@ import {
   formatRMB,
   filterAndSortOrders,
   validateAdminOrderUpdate,
-  exportOrdersToCSV,
 } from '../utils/order-utils.ts';
 
 export const AdminPage: React.FC = () => {
@@ -77,6 +76,7 @@ export const AdminPage: React.FC = () => {
   const [isRotatingToken, setIsRotatingToken] = useState(false);
   const [rotatedTokenResult, setRotatedTokenResult] = useState<string | null>(null);
   const [copiedRotatedToken, setCopiedRotatedToken] = useState(false);
+  const [isAnonymizing, setIsAnonymizing] = useState(false);
 
   // Listen to Firebase Auth state & resolve redirect sign-in results
   useEffect(() => {
@@ -320,6 +320,13 @@ export const AdminPage: React.FC = () => {
 
   const handleRotateQueryToken = async () => {
     if (!editingOrder || !currentUser) return;
+    if (
+      !window.confirm(
+        '重置后客户当前保存的查询凭证会立即失效。请确认已通过预留渠道核实客户身份，是否继续？'
+      )
+    ) {
+      return;
+    }
     setIsRotatingToken(true);
     setModalError(null);
     setRotatedTokenResult(null);
@@ -353,22 +360,89 @@ export const AdminPage: React.FC = () => {
     }
   };
 
-  const handleExportCSV = () => {
+  const handleAnonymizeOrder = async () => {
+    if (!editingOrder || !currentUser) return;
+    if (
+      !window.confirm(
+        '匿名化会清除客户联系方式、需求正文、研究区和内部备注，并立即作废查询凭证。此操作不可撤销，是否继续？'
+      )
+    ) {
+      return;
+    }
+
+    setIsAnonymizing(true);
+    setModalError(null);
+    setSaveSuccessMsg(null);
+    setRotatedTokenResult(null);
+    try {
+      const idToken = await getAdminBearerToken();
+      if (!idToken) {
+        throw new Error('未获取到有效登录凭证，请重新登录');
+      }
+      const res = await fetch(
+        `/api/admin/orders/${encodeURIComponent(editingOrder.orderNumber)}/anonymize`,
+        {
+          method: 'POST',
+          headers: { 'X-Firebase-Auth': `Bearer ${idToken}` },
+        }
+      );
+      const data = await parseJsonResponse(res);
+      if (!res.ok || !data.success) {
+        throw new Error(data.message || '匿名化工单失败');
+      }
+      const updatedOrder: OrderItem = data.order;
+      setOrders((prev) =>
+        prev.map((o) => (o.orderNumber === editingOrder.orderNumber ? updatedOrder : o))
+      );
+      setEditingOrder(updatedOrder);
+      setSaveSuccessMsg('客户文本与联系方式已匿名化，原查询凭证已失效。');
+      setTimeout(() => {
+        handleCloseModal();
+      }, 1200);
+    } catch (err: any) {
+      setModalError(err.message || '匿名化工单失败');
+    } finally {
+      setIsAnonymizing(false);
+    }
+  };
+
+  const handleExportCSV = async () => {
     if (!currentUser || !isAdmin) return;
-    const csvContent = exportOrdersToCSV(filteredOrders);
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.setAttribute('download', `geospatial-orders-${new Date().toISOString().slice(0, 10)}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    URL.revokeObjectURL(url);
-    setBannerNotice({
-      type: 'success',
-      text: `已安全导出 ${filteredOrders.length} 条工单记录至 CSV 文件（已启用公式注入防护）。`,
-    });
+    try {
+      const idToken = await getAdminBearerToken();
+      if (!idToken) {
+        throw new Error('登录状态已失效，请重新登录。');
+      }
+      const res = await fetch('/api/admin/export-csv', {
+        headers: { 'X-Firebase-Auth': `Bearer ${idToken}` },
+      });
+      if (!res.ok) {
+        const data = await parseJsonResponse(res);
+        throw new Error(data.message || `导出失败 (HTTP ${res.status})`);
+      }
+      const csvContent = await res.text();
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute(
+        'download',
+        `geospatial-orders-${new Date().toISOString().slice(0, 10)}.csv`
+      );
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+      setBannerNotice({
+        type: 'success',
+        text: '已从权威数据库导出 CSV（单次最多 10,000 条，已启用公式注入防护）。',
+      });
+    } catch (err: any) {
+      setBannerNotice({
+        type: 'error',
+        text: err.message || '导出全量 CSV 失败',
+      });
+    }
   };
 
   const handleCopy = (text: string) => {
@@ -571,7 +645,7 @@ export const AdminPage: React.FC = () => {
                 className="px-3.5 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 shadow-sm"
               >
                 <Download className="w-3.5 h-3.5" />
-                <span>导出全量 CSV</span>
+                <span>导出工单 CSV</span>
               </button>
 
               <button
@@ -932,6 +1006,29 @@ export const AdminPage: React.FC = () => {
                         </button>
                       </div>
                     )}
+                  </div>
+
+                  {/* Customer deletion / anonymization right */}
+                  <div className="bg-rose-50 border border-rose-200 p-4 rounded-2xl space-y-3 text-rose-950">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div>
+                        <span className="text-xs font-bold flex items-center gap-1.5">
+                          <ShieldAlert className="w-3.5 h-3.5 text-rose-600" />
+                          <span>客户数据删除权 / 匿名化</span>
+                        </span>
+                        <p className="text-[11px] text-rose-800 mt-0.5">
+                          仅在核实客户身份并收到删除或匿名化请求后使用。操作将清除联系方式、需求正文、研究区与备注，并作废查询凭证。
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={isAnonymizing || isRotatingToken}
+                        onClick={handleAnonymizeOrder}
+                        className="px-3 py-1.5 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:bg-rose-300 text-white font-semibold text-xs transition cursor-pointer shrink-0"
+                      >
+                        {isAnonymizing ? '正在匿名化...' : '匿名化客户信息'}
+                      </button>
+                    </div>
                   </div>
 
                   {/* Management Inputs */}

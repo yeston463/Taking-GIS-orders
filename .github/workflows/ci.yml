@@ -13,7 +13,7 @@ jobs:
   verify-build-and-tests:
     name: Clean Clone Build, Type Check & Isolated Tests
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     env:
       NODE_ENV: test
       IGNORE_LOCAL_FIREBASE_CONFIG_FILE: "true"
@@ -32,7 +32,7 @@ jobs:
           cache: "npm"
 
       - name: Install dependencies
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
 
       - name: Verify no tracked secrets or untracked config imports
         run: npm run check:secrets
@@ -43,8 +43,14 @@ jobs:
       - name: Run unit & isolated API/security integration tests
         run: npm test
 
-      - name: Run Firestore Security Rules static & emulator verification
-        run: npm run test:rules
+      - name: Run Firestore Security Rules against the emulator
+        env:
+          REQUIRE_FIRESTORE_EMULATOR: "true"
+        run: >-
+          npx --yes firebase-tools emulators:exec
+          --only firestore
+          --project demo-geospatial-studio-test
+          "npm run test:rules"
 
       - name: Build production frontend bundle
         run: npm run build

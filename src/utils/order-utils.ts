@@ -37,6 +37,8 @@ export interface OrderItem {
   clientNotes?: string;
   queryTokenHash?: string;
   queryTokenUpdatedAt?: string;
+  privacyConsentAt?: string;
+  privacyConsentVersion?: string;
   isDemo?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -78,7 +80,7 @@ export const SERVICE_STARTING_PRICES: Record<ServiceType, number> = {
 
 export const ORDER_STATUS_LABELS: Record<OrderStatus, string> = {
   pending_review: '待确认',
-  pending_quote: 'pending_quote' in {} ? '' : '待报价',
+  pending_quote: '待报价',
   pending_payment: '待付款',
   in_progress: '进行中',
   pending_acceptance: '待验收',
@@ -116,6 +118,7 @@ export function isAllowedStatusTransition(from: OrderStatus, to: OrderStatus): b
 }
 
 export const SAFE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+export const PRIVACY_POLICY_VERSION = '2026-10-31';
 
 export class CryptoUnavailableError extends Error {
   public readonly code = 'CSPRNG_UNAVAILABLE';
@@ -584,6 +587,12 @@ export function cleanOrderForFirestore(order: OrderItem): Record<string, any> {
   }
   if (order.queryTokenUpdatedAt) {
     docData.queryTokenUpdatedAt = order.queryTokenUpdatedAt;
+  }
+  if (order.privacyConsentAt) {
+    docData.privacyConsentAt = order.privacyConsentAt;
+  }
+  if (order.privacyConsentVersion) {
+    docData.privacyConsentVersion = order.privacyConsentVersion;
   }
   if (typeof order.isDemo === 'boolean') {
     docData.isDemo = order.isDemo;

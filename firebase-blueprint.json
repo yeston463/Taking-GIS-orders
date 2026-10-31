@@ -92,6 +92,14 @@
           "description": "Public status notes communicated to client",
           "maxLength": 1000
         },
+        "privacyConsentAt": {
+          "type": "string",
+          "description": "ISO timestamp when the customer accepted the privacy policy"
+        },
+        "privacyConsentVersion": {
+          "type": "string",
+          "description": "Version identifier of the privacy policy accepted by the customer"
+        },
         "createdAt": {
           "type": "string",
           "description": "Creation timestamp ISO string"

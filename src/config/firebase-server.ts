@@ -127,7 +127,16 @@ export function getFirebaseServerConfig(): FirebaseServerConfig {
   const localAuthDomain = cleanConfigValue(localJson?.authDomain);
 
   const projectId = envProjectId || localProjectId;
-  const firestoreDatabaseId = envDatabaseId || localDatabaseId || '(default)';
+  const explicitDatabaseId = envDatabaseId || localDatabaseId;
+  const isProductionLike =
+    process.env.NODE_ENV === 'production' || Boolean(process.env.K_SERVICE);
+  if (isProductionLike && !explicitDatabaseId) {
+    throw new ServerConfigError(
+      '服务端缺少 Firestore Database ID 配置：请在 Cloud Run 设置 FIRESTORE_DATABASE_ID（若确实使用默认库，请显式填写 "(default)"）。',
+      'CONFIG_MISSING_FIRESTORE_DATABASE_ID'
+    );
+  }
+  const firestoreDatabaseId = explicitDatabaseId || '(default)';
   const authDomain =
     envAuthDomain ||
     localAuthDomain ||
@@ -244,7 +253,16 @@ export function verifyFirebaseConfigConsistency(): FirebaseConsistencyReport {
     .replace(/\.firebaseapp\.com$/i, '')
     .replace(/\.web\.app$/i, '');
 
-  const expectedAuthDomain = adminProjectId ? `${adminProjectId}.firebaseapp.com` : '';
+  const normalizedAuthDomain = authDomain.toLowerCase();
+  const knownFirebaseAuthHosts = adminProjectId
+    ? [
+        `${adminProjectId.toLowerCase()}.firebaseapp.com`,
+        `${adminProjectId.toLowerCase()}.web.app`,
+      ]
+    : [];
+  const isOtherFirebaseHost =
+    /\.(firebaseapp\.com|web\.app)$/i.test(normalizedAuthDomain) &&
+    !knownFirebaseAuthHosts.includes(normalizedAuthDomain);
   const runtimeEnvironment: 'cloud_run' | 'ai_studio_or_local' | 'test' =
     process.env.NODE_ENV === 'test'
       ? 'test'
@@ -266,13 +284,7 @@ export function verifyFirebaseConfigConsistency(): FirebaseConsistencyReport {
   } else if (clientCfg.projectId && clientCfg.projectId !== adminProjectId) {
     consistent = false;
     mismatchReason = `Client projectId (${clientCfg.projectId}) !== Admin projectId (${adminProjectId})`;
-  } else if (
-    authDomain &&
-    expectedAuthDomain &&
-    authDomain !== expectedAuthDomain &&
-    !authDomain.endsWith('.firebaseapp.com') &&
-    !authDomain.endsWith('.web.app')
-  ) {
+  } else if (isOtherFirebaseHost) {
     consistent = false;
     mismatchReason = `authDomain (${authDomain}) does not match projectId (${adminProjectId})`;
   } else if (
@@ -348,38 +360,34 @@ export const FORBIDDEN_DEMO_UIDS = new Set([
 ]);
 
 /**
- * Verified owner Firebase Authentication UIDs (`yeston463@gmail.com`).
- * Included automatically in non-test server runtime alongside `process.env.ADMIN_UIDS`.
+ * Reads the raw server-side `ADMIN_UIDS` entries. Entries are never echoed back
+ * to clients by the diagnostics endpoint.
  */
-export const BOOTSTRAP_ADMIN_UIDS = ['xewWzS52oyOTsVKxZlDUhnoedAB2'] as const;
-
-/**
- * Returns the server-side configured `ADMIN_UIDS` set.
- * Never accepts email addresses or hardcoded demo UIDs.
- */
-export function getServerAdminUidWhitelist(overrideList?: string[]): Set<string> {
-  const envEntries = (process.env.ADMIN_UIDS || '')
+function readAdminUidEntries(): string[] {
+  return (process.env.ADMIN_UIDS || '')
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean);
+}
 
-  const rawList =
-    overrideList !== undefined
-      ? overrideList
-      : process.env.NODE_ENV === 'test'
-        ? envEntries
-        : [
-            ...BOOTSTRAP_ADMIN_UIDS,
-            ...envEntries.filter((entry) => entry.length >= 20),
-          ];
+function isAcceptableAdminUid(uid: string): boolean {
+  return (
+    typeof uid === 'string' &&
+    uid.length >= 20 &&
+    !FORBIDDEN_DEMO_UIDS.has(uid.toLowerCase()) &&
+    !uid.includes('@')
+  );
+}
 
-  const safeSet = new Set<string>();
-  for (const uid of rawList) {
-    if (uid && !FORBIDDEN_DEMO_UIDS.has(uid.toLowerCase()) && !uid.includes('@')) {
-      safeSet.add(uid);
-    }
-  }
-  return safeSet;
+/**
+ * Returns the server-side configured `ADMIN_UIDS` set.
+ * Never accepts email addresses, short email prefixes, or demo UIDs.
+ * There is no hardcoded bootstrap UID: administrators must be configured
+ * explicitly through `ADMIN_UIDS` or a verified `admin` custom claim.
+ */
+export function getServerAdminUidWhitelist(overrideList?: string[]): Set<string> {
+  const rawList = overrideList !== undefined ? overrideList : readAdminUidEntries();
+  return new Set(rawList.filter(isAcceptableAdminUid));
 }
 
 /**
@@ -390,25 +398,25 @@ export function diagnoseAdminUidWhitelist(overrideList?: string[]): {
   configuredCount: number;
   warnings: string[];
 } {
-  const whitelist = getServerAdminUidWhitelist(overrideList);
+  const rawList = overrideList !== undefined ? overrideList : readAdminUidEntries();
+  const whitelist = getServerAdminUidWhitelist(rawList);
   const warnings: string[] = [];
+  const rejectedCount = rawList.filter((uid) => !isAcceptableAdminUid(uid)).length;
 
-  if (whitelist.size === 0) {
+  if (rawList.length === 0) {
     warnings.push(
       'ADMIN_UIDS 尚未配置。请先在 /#admin 页面使用 Google 账号登录，复制界面显示的真实 Firebase UID 填入 ADMIN_UIDS。'
     );
-  } else {
-    let shortEntryCount = 0;
-    for (const uid of whitelist) {
-      if (uid.length < 20) {
-        shortEntryCount++;
-      }
-    }
-    if (shortEntryCount > 0) {
-      warnings.push(
-        `ADMIN_UIDS 中存在 ${shortEntryCount} 个长度不足 20 字符的条目，可能为邮箱前缀而非真实的 28 位 Firebase Auth UID。若登录报 403，请以 /#admin 登录页回显的真实 UID 为准。`
-      );
-    }
+  } else if (rejectedCount > 0) {
+    warnings.push(
+      `ADMIN_UIDS 中有 ${rejectedCount} 个条目未被接受（长度不足 20 字符、包含 @、或属于保留的演示 UID），请填写真实的 Firebase Auth UID。`
+    );
+  }
+
+  if (whitelist.size === 0 && rawList.length > 0) {
+    warnings.push(
+      '当前没有任何有效的 ADMIN_UIDS 条目；除 admin Custom Claim 外，管理后台将拒绝所有账号。'
+    );
   }
 
   return {

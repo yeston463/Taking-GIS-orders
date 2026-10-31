@@ -47,7 +47,17 @@ npm run migrate:check
 - `CONFLICT_OLDER_OR_EQUAL`：目标 Firestore 中已存在相同或更新的 `updatedAt` 记录，跳过以防覆盖新状态。
 - `CONFLICT_NEWER`：本地记录的 `updatedAt` 比云端更新，需人工复核字段差异。
 
-### 步骤 3：历史工单的 `queryTokenHash` 补齐策略
+### 步骤 3：执行迁移（人工审批后）
+```bash
+npm run migrate:check -- --execute --approve
+```
+执行行为：
+- 仅处理 `REAL_CUSTOMER` 且 `action !== CONFLICT_OLDER_OR_EQUAL` 的记录，`DEMO_SEED` 始终跳过。
+- 通过 `importOrderAtomic(order, 'if-newer')` 在 Firestore 事务中写入：目标不存在则创建，目标较旧则更新，目标相同或更新则跳过。
+- 源文件存在重复工单号或目标数据库不可达时拒绝执行；单条失败会汇总并返回非零退出码。
+- 脚本只读源文件，不删除、不改写 `.data/orders.json`；Windows 与 POSIX 均可通过 `pathToFileURL` 正确触发 CLI。
+
+### 步骤 4：历史工单的 `queryTokenHash` 补齐策略
 由于旧版工单未生成 `queryTokenHash`（`hasTokenHash: false`），迁移后客户无法使用旧版“邮箱/微信号”直查。标准处置流程为：
 1. 管理员登录后台，在工单详情弹窗中点击 **「重置并签发新查询凭证」**（调用 `POST /api/admin/orders/:id/rotate-token`）。
 2. 系统通过 CSPRNG 生成新的 `QK-XXXX-XXXX-XXXX` 凭证并将 HMAC-SHA256 哈希写入 Firestore。

@@ -71,3 +71,27 @@
 2. **AI Studio 预览沙箱直接读写正式 Cloud Firestore (`FirestoreAdminOrderRepository`) — `BLOCKED (Sandbox Cross-Project ADC Limitation)`**：
    - **原因**：AI Studio 预览容器的默认 ADC 服务账号属于宿主沙箱项目（`ais-sandbox@...`），对用户的目标 Firebase 项目 `gen-lang-client-0041017161` 数据库 `ai-studio-cb63a7bd-f74c-4c79-9ba8-1cb9e33b42e9` 无跨项目 IAM 写权限，访问时返回 `503 FIRESTORE_IAM_PERMISSION_DENIED`（符合预期 Fail-Closed 保护，不产生假成功）。
    - **解锁方式**：将应用部署至同一 GCP 项目 `gen-lang-client-0041017161` 的 Cloud Run，并为 Cloud Run 运行服务账号绑定 `roles/datastore.user` 与 `roles/firebaseauth.viewer`。
+
+---
+
+## 四、2026-10-31 P0/P1 修复复跑记录（HEAD `07066de` + 修复）
+
+| 验证项 | 命令 | 结果 |
+| :--- | :--- | :--- |
+| 依赖安装（含锁文件） | `npm ci` | PASS |
+| 类型检查（`strict: true`） | `npm run lint` | PASS |
+| 单元 + 隔离 API/安全测试 | `npm test` | PASS（22/22） |
+| 密钥扫描 | `npm run check:secrets` | PASS |
+| 生产构建 | `npm run build` | PASS |
+| Firestore 规则测试 | `npm run test:rules` | 本地无 Emulator：skipped（不再假绿）；CI 使用 `firebase emulators:exec` 强制运行 |
+| dev 模式加载 `.env` | `npm run dev` + `/api/health` | PASS |
+| 空 JSON body / 畸形 JSON | 回归测试 + 手工 curl | 不再挂起；返回结构化 400 |
+| 无 ADC 时下单 | 生产 `server.ts` + 合法 POST | 返回 503，进程保持存活（不再崩溃） |
+| 后台全量导出 | `/api/admin/export-csv` | 改为服务端权威导出；`listOrders` 分页至 10,000 条上限 |
+| 客户匿名化 | `POST /api/admin/orders/:id/anonymize` | PASS（清除联系方式/正文并使旧凭证失效） |
+| 迁移执行 | `migrate:check -- --execute --approve` | PASS（临时工作区验证：真实记录创建、Demo 跳过） |
+| 新工单通知（可选） | `ORDER_NOTIFICATION_WEBHOOK_URL` + 回归测试 | PASS（发送脱敏联系方式，最多等待 3 秒且不影响建单） |
+| 依赖审计 | `npm audit` | 0 high / 0 critical；4 moderate 传递依赖（glob/minimatch/rimraf/google-gax） |
+| `npm run preview` | 预览服务器挂载 `/api` | PASS（与 dev/prod 相同的 API 路由） |
+
+> 说明：GitHub Actions 需在推送后重新运行；本记录不代表远程 CI 已通过。

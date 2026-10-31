@@ -20,6 +20,6 @@
 
 ---
 
-## 2. 当前环境中 `ADMIN_UIDS` 的配置提醒
-- 经实时诊断（`GET /api/health`），当前容器环境变量中的 `ADMIN_UIDS` 值为 `"yeston463"`（长度为 9 字符，系邮箱前缀，而非 Firebase Authentication 生成的 28 位真实 `UID`）。
-- 服务端已拒绝将邮箱或邮箱前缀作为授权依据，并在 `/api/health` 的 `diagnostics.adminAuth.warnings` 中给出了明确诊断提示。请在 `/#admin` 页面使用 Google 账号登录一次，复制界面回显的 28 位真实 Firebase UID 并更新至 `ADMIN_UIDS`。
+## 2. `ADMIN_UIDS` 配置提醒
+- `ADMIN_UIDS` 必须是 Firebase Authentication 生成的真实 UID（通常 28 位），不能填写邮箱或邮箱前缀。服务端不会内置任何硬编码管理员 UID。
+- 若填写了邮箱前缀或过短的条目，这些条目会被拒绝，并可在管理员鉴权接口 `GET /api/admin/diagnostics` 的 `diagnostics.adminAuth.warnings` 中看到提示；未配置时 `configuredCount` 为 `0`。请使用 `/#admin` 页面 Google 登录后回显的真实 UID 更新配置。

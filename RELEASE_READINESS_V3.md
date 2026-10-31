@@ -2,11 +2,11 @@
 
 ## 一、最终准入判定
 
-> **当前准入状态：`READY FOR STAGING`（代码及隔离测试已全部通过，从干净 Git 克隆可 100% 复现构建与测试，可进入真实云环境 Cloud Run 验收）**
+> **当前准入状态：`READY FOR STAGING`（2026-10-31 本地 P0/P1 修复验证通过：npm ci、lint、22 项测试、check:secrets、build 均通过；推送后需 GitHub CI 绿灯，Firestore 规则动态测试需要 Emulator）**
 
 ### 判定依据对照
 - 为什么不是 `NOT READY`？
-  - P0-A（干净克隆缺少 `firebase-applet-config.json` 导致构建失败）、P0-B（测试污染生产 Firestore）、P1-A（重复提交丢失查询凭证）、P1-B（限流失败静默退回单机内存）、P1-C（公开 `/api/health` 泄露内部配置）、P1-D（`Math.random()` 回退与取模偏差）、P2（缺少 CI 与密钥扫描）均已全部在代码中实质修复，并在无 `firebase-applet-config.json` 的干净克隆环境中通过 `check:secrets`、`lint`、`test`、`test:rules`、`build` 验证（全部退出码 `0`）。
+  - P0-A（干净克隆缺少 `firebase-applet-config.json` 导致构建失败）、P0-B（测试污染生产 Firestore）、P1-A（重复提交丢失查询凭证）、P1-B（限流失败静默退回单机内存）、P1-C（公开 `/api/health` 泄露内部配置）、P1-D（`Math.random()` 回退与取模偏差）、P2（缺少 CI 与密钥扫描）均已全部在代码中实质修复，并通过 `npm ci`、`check:secrets`、`lint`、`test`、`build` 验证；`test:rules` 在本地无 Emulator 时明确标记 skipped，CI 通过 `firebase emulators:exec` 强制执行。
 - 为什么当前是 `READY FOR STAGING` 而非直接宣称生产环境已全量就绪？
   - 在 AI Studio 预览沙箱中，容器宿主 ADC 服务账号（`ais-sandbox@...`）因跨项目隔离限制无法直接读写用户项目 `gen-lang-client-0041017161` 的正式 Firestore 数据库（系统已按设计安全返回 `503`，不伪造成功）；同时真实 Google 登录与正式 Cloud Run 实例下的全链路验收需在用户部署至 Cloud Run Staging/生产环境并完成环境变量配置后进行最终人工确认。
 

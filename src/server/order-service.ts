@@ -1,7 +1,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { getFirestore, Firestore } from 'firebase-admin/firestore';
+import { getFirestore, Firestore, Timestamp } from 'firebase-admin/firestore';
 import {
   getFirebaseServerConfig,
   getFirebaseAdminApp,
@@ -15,6 +15,7 @@ import {
   OrderInputPayload,
   AdminOrderUpdateInput,
   SAFE_ALPHABET,
+  PRIVACY_POLICY_VERSION,
   generateOrderId,
   generateOrderNumber,
   generateQueryToken,
@@ -25,6 +26,7 @@ import {
   toPublicOrderView,
   PublicOrderView,
 } from '../utils/order-utils.ts';
+import { notifyNewOrder } from './notifier.ts';
 
 export {
   getFirebaseServerConfig,
@@ -219,6 +221,34 @@ export function deriveSessionQueryToken(
 export const IDEMPOTENCY_EXPLICIT_TTL_MS = 15 * 60 * 1000; // 15 minutes for explicit key retries
 export const IDEMPOTENCY_CONTENT_WINDOW_MS = 60 * 1000; // 60 seconds for accidental tab-reopen duplicate submit
 
+const FIRESTORE_OPERATION_TIMEOUT_MS = 8000;
+
+function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new DatabaseUnavailableError(
+          '订单数据库响应超时，请稍后重试。系统未保存任何半成品数据。',
+          'DATABASE_TIMEOUT',
+          `[FirestoreAdminOrderRepository] op=${label} timeoutMs=${FIRESTORE_OPERATION_TIMEOUT_MS}`
+        )
+      );
+    }, FIRESTORE_OPERATION_TIMEOUT_MS);
+    timer.unref?.();
+
+    operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      }
+    );
+  });
+}
+
 /**
  * Computes the payload content & contact fingerprint so two different customers
  * or two different order descriptions never collide even if an idempotency key is reused.
@@ -274,6 +304,8 @@ export interface IdempotencyRecord {
   contentDigest: string;
   createdAt: string;
   expiresAt: number;
+  /** Firestore TTL policy target; numeric expiresAt remains for application logic. */
+  ttlAt?: Timestamp;
 }
 
 export interface RateLimitDetail {
@@ -306,6 +338,10 @@ export interface OrderRepository {
     idOrNumber: string,
     updater: (existing: OrderItem) => OrderItem
   ): Promise<OrderItem>;
+  importOrderAtomic(
+    order: OrderItem,
+    policy?: 'if-newer'
+  ): Promise<'created' | 'updated' | 'skipped'>;
   checkRateLimit(
     key: string,
     limit: number,
@@ -448,7 +484,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     const ttlMs = idempotencyMeta?.ttlMs || IDEMPOTENCY_EXPLICIT_TTL_MS;
 
     try {
-      return await this.db.runTransaction(async (tx) => {
+      return await withTimeout(
+        this.db.runTransaction(async (tx) => {
         const idemRef = this.db.collection(this.idempotencyCollection).doc(idempotencyKey);
         if (!idempotencyMeta?.bypassExisting) {
           const idemSnap = await tx.get(idemRef);
@@ -497,10 +534,13 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
           contentDigest: idempotencyMeta?.contentDigest || '',
           createdAt: candidateOrder.createdAt,
           expiresAt: nowMs + ttlMs,
+          ttlAt: Timestamp.fromMillis(nowMs + ttlMs),
         } satisfies IdempotencyRecord);
 
         return { order: candidateOrder, duplicate: false, matchedMode: metaMode };
-      });
+        }),
+        'createOrderAtomic'
+      );
     } catch (err: any) {
       if (
         err instanceof DatabaseUnavailableError ||
@@ -517,7 +557,10 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     const normalized = String(orderNumber || '').trim().toUpperCase();
     if (!normalized) return null;
     try {
-      const snap = await this.db.collection(this.ordersCollection).doc(normalized).get();
+      const snap = await withTimeout(
+        this.db.collection(this.ordersCollection).doc(normalized).get(),
+        'getOrderByNumber'
+      );
       if (!snap.exists) return null;
       return snap.data() as OrderItem;
     } catch (err: any) {
@@ -529,18 +572,21 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     const trimmed = String(idOrNumber || '').trim();
     if (!trimmed) return null;
     try {
-      const directSnap = await this.db
-        .collection(this.ordersCollection)
-        .doc(trimmed.toUpperCase())
-        .get();
+      const directSnap = await withTimeout(
+        this.db.collection(this.ordersCollection).doc(trimmed.toUpperCase()).get(),
+        'getOrderByIdOrNumber'
+      );
       if (directSnap.exists) {
         return directSnap.data() as OrderItem;
       }
-      const qSnap = await this.db
-        .collection(this.ordersCollection)
-        .where('id', '==', trimmed)
-        .limit(1)
-        .get();
+      const qSnap = await withTimeout(
+        this.db
+          .collection(this.ordersCollection)
+          .where('id', '==', trimmed)
+          .limit(1)
+          .get(),
+        'getOrderByIdOrNumber'
+      );
       if (qSnap.empty) return null;
       return qSnap.docs[0].data() as OrderItem;
     } catch (err: any) {
@@ -549,13 +595,33 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
   }
 
   async listOrders(): Promise<OrderItem[]> {
+    const pageSize = 500;
+    const maxOrders = 10000;
+    const results: OrderItem[] = [];
+    let lastDoc: FirebaseFirestore.QueryDocumentSnapshot | null = null;
+
     try {
-      const snap = await this.db
-        .collection(this.ordersCollection)
-        .orderBy('createdAt', 'desc')
-        .limit(500)
-        .get();
-      return snap.docs.map((d) => d.data() as OrderItem);
+      while (results.length < maxOrders) {
+        let query: FirebaseFirestore.Query = this.db
+          .collection(this.ordersCollection)
+          .orderBy('createdAt', 'desc')
+          .limit(Math.min(pageSize, maxOrders - results.length));
+        if (lastDoc) {
+          query = query.startAfter(lastDoc);
+        }
+        const snap = await withTimeout(query.get(), 'listOrders');
+        results.push(...snap.docs.map((d) => d.data() as OrderItem));
+        if (snap.empty || snap.size < pageSize) break;
+        const last = snap.docs[snap.docs.length - 1];
+        if (!last) break;
+        lastDoc = last;
+      }
+      if (results.length >= maxOrders) {
+        console.warn(
+          `[FirestoreAdminOrderRepository] listOrders reached safety cap ${maxOrders}; older orders are not returned.`
+        );
+      }
+      return results;
     } catch (err: any) {
       this.wrapFirestoreError(err, 'listOrders');
     }
@@ -566,7 +632,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     updater: (existing: OrderItem) => OrderItem
   ): Promise<OrderItem> {
     try {
-      return await this.db.runTransaction(async (tx) => {
+      return await withTimeout(
+        this.db.runTransaction(async (tx) => {
         const trimmed = String(idOrNumber || '').trim();
         let docRef = this.db.collection(this.ordersCollection).doc(trimmed.toUpperCase());
         let snap = await tx.get(docRef);
@@ -586,7 +653,9 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
         const updated = updater(existing);
         tx.set(docRef, cleanOrderForFirestore(updated));
         return updated;
-      });
+        }),
+        'updateOrderAtomic'
+      );
     } catch (err: any) {
       if (
         err instanceof OrderNotFoundError ||
@@ -597,6 +666,51 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
         throw err;
       }
       this.wrapFirestoreError(err, 'updateOrderAtomic');
+    }
+  }
+
+  async importOrderAtomic(
+    order: OrderItem,
+    policy: 'if-newer' = 'if-newer'
+  ): Promise<'created' | 'updated' | 'skipped'> {
+    const normalizedNumber = String(order.orderNumber || '').trim().toUpperCase();
+    if (!normalizedNumber) {
+      throw new OrderValidationError('迁移工单缺少合法工单号');
+    }
+    const sourceTime = new Date(order.updatedAt).getTime();
+    if (!Number.isFinite(sourceTime)) {
+      throw new OrderValidationError('迁移工单 updatedAt 不是合法时间');
+    }
+
+    try {
+      return await withTimeout(
+        this.db.runTransaction(async (tx) => {
+          const ref = this.db.collection(this.ordersCollection).doc(normalizedNumber);
+          const snap = await tx.get(ref);
+          if (snap.exists) {
+            const existing = snap.data() as OrderItem;
+            const existingTime = new Date(existing.updatedAt).getTime();
+            if (
+              policy === 'if-newer' &&
+              Number.isFinite(existingTime) &&
+              existingTime >= sourceTime
+            ) {
+              return 'skipped';
+            }
+          }
+          tx.set(
+            ref,
+            cleanOrderForFirestore({ ...order, orderNumber: normalizedNumber })
+          );
+          return snap.exists ? 'updated' : 'created';
+        }),
+        'importOrderAtomic'
+      );
+    } catch (err: any) {
+      if (err instanceof DatabaseUnavailableError || err instanceof OrderValidationError) {
+        throw err;
+      }
+      this.wrapFirestoreError(err, 'importOrderAtomic');
     }
   }
 
@@ -626,7 +740,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const result = await this.db.runTransaction(async (tx) => {
+        const result = await withTimeout(
+          this.db.runTransaction(async (tx) => {
           const ref = this.db.collection(this.rateLimitCollection).doc(safeKey);
           const snap = await tx.get(ref);
           const currentNow = Date.now();
@@ -666,6 +781,7 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
             windowStart,
             expiresAt: windowStart + windowMs,
             updatedAt: currentNow,
+            ttlAt: Timestamp.fromMillis(windowStart + windowMs),
           });
 
           return {
@@ -675,7 +791,9 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
             remaining: Math.max(0, limit - nextCount),
             retryAfterSeconds: 0,
           };
-        });
+          }),
+          'checkRateLimitDetailed'
+        );
 
         recordL1Observation(safeKey, result.count, result.windowStart);
         return {
@@ -686,7 +804,10 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
         };
       } catch (err: any) {
         lastErr = err;
-        const category = classifyFirestoreRateLimitError(err);
+        const category =
+          err instanceof DatabaseUnavailableError && err.code === 'DATABASE_TIMEOUT'
+            ? 'TIMEOUT'
+            : classifyFirestoreRateLimitError(err);
         if (category === 'TRANSACTION_CONFLICT' && attempt < maxAttempts) {
           await new Promise((r) => setTimeout(r, 20 * attempt));
           continue;
@@ -695,7 +816,10 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
       }
     }
 
-    const category = classifyFirestoreRateLimitError(lastErr);
+    const category =
+      lastErr instanceof DatabaseUnavailableError && lastErr.code === 'DATABASE_TIMEOUT'
+        ? 'TIMEOUT'
+        : classifyFirestoreRateLimitError(lastErr);
     console.error(
       `[RateLimitFailure] scope=${scope} category=${category} msg=${lastErr?.message || lastErr}`
     );
@@ -921,6 +1045,42 @@ export class IsolatedTestOrderRepository implements OrderRepository {
     });
   }
 
+  async importOrderAtomic(
+    order: OrderItem,
+    policy: 'if-newer' = 'if-newer'
+  ): Promise<'created' | 'updated' | 'skipped'> {
+    return this.withLock(() => {
+      const state = this.readState();
+      const normalizedNumber = String(order.orderNumber || '').trim().toUpperCase();
+      if (!normalizedNumber) {
+        throw new OrderValidationError('迁移工单缺少合法工单号');
+      }
+      const sourceTime = new Date(order.updatedAt).getTime();
+      if (!Number.isFinite(sourceTime)) {
+        throw new OrderValidationError('迁移工单 updatedAt 不是合法时间');
+      }
+
+      const existing = state.orders[normalizedNumber];
+      if (existing) {
+        const existingTime = new Date(existing.updatedAt).getTime();
+        if (
+          policy === 'if-newer' &&
+          Number.isFinite(existingTime) &&
+          existingTime >= sourceTime
+        ) {
+          return 'skipped';
+        }
+      }
+
+      state.orders[normalizedNumber] = cleanOrderForFirestore({
+        ...order,
+        orderNumber: normalizedNumber,
+      }) as OrderItem;
+      this.writeState(state);
+      return existing ? 'updated' : 'created';
+    });
+  }
+
   async checkRateLimitDetailed(
     key: string,
     limit: number,
@@ -1087,6 +1247,8 @@ export class OrderService {
           clientNotes: '需求已成功登记，工作室工程师正在查阅技术细节与数据要求。',
           queryTokenHash: tokenHash,
           queryTokenUpdatedAt: now,
+          privacyConsentAt: now,
+          privacyConsentVersion: PRIVACY_POLICY_VERSION,
           isDemo: false,
           createdAt: now,
           updatedAt: now,
@@ -1102,6 +1264,7 @@ export class OrderService {
     );
 
     if (!duplicate) {
+      await notifyNewOrder(order);
       return {
         orderNumber: order.orderNumber,
         queryToken: generatedToken,
@@ -1227,6 +1390,27 @@ export class OrderService {
             ? String(input.clientNotes).slice(0, 1000)
             : existing.clientNotes,
         updatedAt: new Date().toISOString(),
+      };
+    });
+  }
+
+  async anonymizeOrderByAdmin(idOrNumber: string): Promise<OrderItem> {
+    return this.repo.updateOrderAtomic(idOrNumber, (existing) => {
+      const now = new Date().toISOString();
+      return {
+        ...existing,
+        title: '已匿名化工单',
+        description: '客户已请求删除或匿名化本条工单正文。',
+        studyArea: '',
+        dataFormats: '',
+        budgetRange: '',
+        expectedDeliveryDate: '',
+        contactValue: '***',
+        adminNotes: '',
+        clientNotes: '该工单已按客户要求匿名化。',
+        queryTokenHash: undefined,
+        queryTokenUpdatedAt: now,
+        updatedAt: now,
       };
     });
   }

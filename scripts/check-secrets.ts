@@ -60,6 +60,10 @@ const allFiles = walkFiles(ROOT);
 
 for (const file of allFiles) {
   const rel = path.relative(ROOT, file);
+  const baseName = path.basename(rel);
+  // Local .env files are gitignored and are expected to hold the public
+  // Firebase web API key; only the committed template is scanned.
+  if (baseName.startsWith('.env') && baseName !== '.env.example') continue;
   if (/\.(png|jpg|jpeg|gif|webp|ico|woff2?|ttf|eot|webm|mp4)$/i.test(rel)) continue;
 
   const content = fs.readFileSync(file, 'utf-8');

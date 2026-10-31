@@ -60,10 +60,10 @@ export const PrivacyPage: React.FC = () => {
               <strong>实际收集的工单字段</strong>：仅收集您主动填写的服务类型（<code>serviceType</code>）、需求标题（<code>title</code>）、需求详述（<code>description</code>）、研究区范围（<code>studyArea</code>）、数据格式（<code>dataFormats</code>）、预算区间（<code>budgetRange</code>）、期望交付日期（<code>expectedDeliveryDate</code>）以及联系渠道与联系值（<code>contactMethod</code> / <code>contactValue</code>）。同时系统会记录请求源 IP 的哈希值用于短时防刷限流。
             </li>
             <li>
-              <strong>权威存储与访问控制</strong>：工单记录通过服务端受控接口持久化于 Google Cloud / Firebase Firestore 权威数据库，客户端直连读写权限已全部关闭（<code>allow read, write: if false</code>）。仅通过服务端 Firebase Admin SDK 验证 ID Token 且列入服务端 <code>ADMIN_UIDS</code> 白名单的管理员可读取完整联系信息。
+              <strong>权威存储与访问控制</strong>：工单记录通过服务端受控接口持久化于 Google Cloud / Firebase Firestore 权威数据库，客户端直连读写权限已全部关闭（<code>allow read, write: if false</code>）。仅通过服务端 Firebase Admin SDK 验证 ID Token 且列入服务端 <code>ADMIN_UIDS</code> 白名单或持有 <code>admin</code> Custom Claim 的管理员可读取完整联系信息。
             </li>
             <li>
-              <strong>高熵查询凭证与联系方式脱敏</strong>：提交工单时系统使用密码学安全随机数（CSPRNG）生成一次性专属查询凭证（<code>QK-XXXX-XXXX-XXXX</code>），数据库仅保存其 HMAC-SHA256 哈希值（<code>queryTokenHash</code>），不保存明文凭证。公开工单查询接口仅返回脱敏后的联系方式（如 <code>cl***s@163.com</code>）且严格剥离内部管理备注（<code>adminNotes</code>）。
+              <strong>高熵查询凭证与联系方式脱敏</strong>：提交工单时系统生成高熵专属查询凭证（<code>QK-XXXX-XXXX-XXXX</code>）；浏览器会话为支持断网重试会使用服务端 HMAC 派生同一凭证。数据库仅保存其 HMAC-SHA256 哈希值（<code>queryTokenHash</code>），不保存明文凭证；凭证在管理员重置前有效。公开工单查询接口仅返回脱敏后的联系方式（如 <code>cl***s@163.com</code>）且严格剥离内部管理备注（<code>adminNotes</code>）。
             </li>
           </ul>
         </div>
@@ -87,7 +87,7 @@ export const PrivacyPage: React.FC = () => {
               <strong>受限生产隔离</strong>：您的原始空间数据仅在项目开发专用受限工作机上加载计算，不上传至任何第三方未加密公共网盘或大模型训练库。
             </li>
             <li>
-              <strong>数据保留与销毁周期</strong>：项目全款交付验收后保留 14 天作为售后答疑期；答疑期满后，所有客户原始空间数据文件将被彻底安全擦除。在线工单文本记录可根据客户邮件申请随时予以匿名化或删除。
+              <strong>数据保留与销毁周期</strong>：项目全款交付验收后保留 14 天作为售后答疑期；答疑期满后，所有客户原始空间数据文件将被彻底安全擦除。在线工单文本记录可根据客户邮件申请，在核实身份后由管理员执行匿名化（清除联系方式、需求正文、研究区与内部备注，并使查询凭证立即失效）。
             </li>
           </ul>
         </div>

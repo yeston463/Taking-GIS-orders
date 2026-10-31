@@ -179,13 +179,23 @@ class InvalidJsonPayloadError extends Error {
 
 // Body parsing helper with strict 32KB size limit for both Express and Connect middleware
 async function parseBody(req: any): Promise<any> {
-  if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+  // body-parser (Express) has already consumed the stream. This includes the
+  // empty-object case for an empty JSON body; never try to re-read the stream.
+  if (req.body !== undefined) {
+    if (req.body === null || typeof req.body !== 'object' || Array.isArray(req.body)) {
+      throw new InvalidJsonPayloadError('请求体必须为 JSON 对象');
+    }
     const serializedLen = Buffer.byteLength(JSON.stringify(req.body), 'utf8');
     if (serializedLen > MAX_BODY_BYTES) {
       throw new PayloadTooLargeError();
     }
     return req.body;
   }
+
+  if (req.readableEnded) {
+    return {};
+  }
+
   return new Promise((resolve, reject) => {
     let raw = '';
     let bytesRead = 0;
@@ -253,8 +263,15 @@ function extractBearerToken(req: Request): string | null {
 
 export function createApiRouter(options?: ApiRouterOptions): Router {
   const router = express.Router();
-  const orderService =
-    options?.orderService || createDefaultOrderService(options?.orderRepository);
+  // Constructed lazily so a missing server config still lets the site load and
+  // lets API handlers answer with an explicit 503 instead of crashing dev boot.
+  let orderService: OrderService | null = options?.orderService || null;
+  const getOrderService = (): OrderService => {
+    if (!orderService) {
+      orderService = createDefaultOrderService(options?.orderRepository);
+    }
+    return orderService;
+  };
 
   const defaultTokenVerifier: TokenVerifierFn = async (idToken: string) => {
     const adminApp = getFirebaseAdminApp();
@@ -269,6 +286,8 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     (req as any).requestId = reqId;
     if (typeof res.setHeader === 'function') {
       res.setHeader('X-Request-Id', reqId);
+      res.setHeader('Cache-Control', 'no-store');
+      res.setHeader('X-Content-Type-Options', 'nosniff');
     }
     next();
   });
@@ -327,7 +346,17 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     let decoded: DecodedIdToken;
     try {
       decoded = await verifyIdTokenFn(token);
-    } catch {
+    } catch (err: any) {
+      if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+        sendJson(res, 503, {
+          success: false,
+          isAdmin: false,
+          code: err.code,
+          requestId,
+          message: err.message,
+        });
+        return;
+      }
       sendJson(res, 401, {
         success: false,
         isAdmin: false,
@@ -398,18 +427,38 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
    * Authenticated Admin Diagnostics Endpoint (P1-C):
    * Requires verified Firebase ID Token + Admin authorization.
    */
-  router.get('/admin/diagnostics', requireAdminAuth, (_req: Request, res: Response) => {
-    const serverCfg = getFirebaseServerConfig();
-    const diagnostics = getRuntimeConfigDiagnostics(options);
-    sendJson(res, 200, {
-      success: true,
-      status: 'ok',
-      repositoryDriver: orderService.getRepositoryDriverName(),
-      projectId: serverCfg.projectId || null,
-      firestoreDatabaseId: serverCfg.firestoreDatabaseId || null,
-      diagnostics,
-      serverTime: new Date().toISOString(),
-    });
+  router.get('/admin/diagnostics', requireAdminAuth, (req: Request, res: Response) => {
+    const requestId = (req as any).requestId || generateRequestId();
+    try {
+      const serverCfg = getFirebaseServerConfig();
+      const service = getOrderService();
+      const diagnostics = getRuntimeConfigDiagnostics(options);
+      sendJson(res, 200, {
+        success: true,
+        status: 'ok',
+        repositoryDriver: service.getRepositoryDriverName(),
+        projectId: serverCfg.projectId || null,
+        firestoreDatabaseId: serverCfg.firestoreDatabaseId || null,
+        diagnostics,
+        serverTime: new Date().toISOString(),
+      });
+    } catch (err: any) {
+      if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+        sendJson(res, 503, {
+          success: false,
+          code: err.code,
+          requestId,
+          message: err.message,
+        });
+        return;
+      }
+      sendJson(res, 500, {
+        success: false,
+        code: 'INTERNAL_ERROR',
+        requestId,
+        message: '读取服务端诊断信息失败。',
+      });
+    }
   });
 
   // Public order submission with fail-closed rate limiting, validation, idempotency, and authoritative DB transaction
@@ -418,7 +467,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     try {
       const ip = getClientIp(req, options?.trustProxy);
       const maxOrdersPerWindow = options?.orderRateLimitMax ?? 10;
-      const repo = orderService.getRepository();
+      const repo = getOrderService().getRepository();
 
       const rateCheck = repo.checkRateLimitDetailed
         ? await repo.checkRateLimitDetailed(
@@ -462,7 +511,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
           ? req.headers['x-idempotency-key']
           : undefined;
 
-      const result = await orderService.createCustomerOrder(payload, ip, explicitIdemKey);
+      const result = await getOrderService().createCustomerOrder(payload, ip, explicitIdemKey);
 
       const isReplay = result.submissionStatus === 'IDEMPOTENT_REPLAY';
       const httpStatus = isReplay ? 200 : 201;
@@ -560,7 +609,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     try {
       const ip = getClientIp(req, options?.trustProxy);
       const maxLookupPerWindow = options?.lookupRateLimitMax ?? 30;
-      const repo = orderService.getRepository();
+      const repo = getOrderService().getRepository();
 
       const ipRate = repo.checkRateLimitDetailed
         ? await repo.checkRateLimitDetailed(
@@ -650,7 +699,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         return;
       }
 
-      const publicOrder = await orderService.lookupCustomerOrder(orderNumber, queryToken);
+      const publicOrder = await getOrderService().lookupCustomerOrder(orderNumber, queryToken);
 
       sendJson(res, 200, {
         success: true,
@@ -744,7 +793,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
   router.get('/admin/orders', requireAdminAuth, async (req: Request, res: Response) => {
     const requestId = (req as any).requestId || generateRequestId();
     try {
-      const orders = await orderService.listOrdersForAdmin();
+      const orders = await getOrderService().listOrdersForAdmin();
       sendJson(res, 200, {
         success: true,
         orders,
@@ -773,7 +822,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     try {
       const { id } = req.params;
       const body = await parseBody(req);
-      const updated = await orderService.updateOrderByAdmin(id, {
+      const updated = await getOrderService().updateOrderByAdmin(id, {
         status: body.status,
         manualQuote: body.manualQuote,
         adminNotes: body.adminNotes,
@@ -837,7 +886,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       const requestId = (req as any).requestId || generateRequestId();
       try {
         const { id } = req.params;
-        const rotated = await orderService.rotateOrderQueryTokenByAdmin(id);
+        const rotated = await getOrderService().rotateOrderQueryTokenByAdmin(id);
         sendJson(res, 200, {
           success: true,
           orderNumber: rotated.orderNumber,
@@ -874,11 +923,53 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     }
   );
 
+  // Admin: Anonymize customer text/contact fields on verified deletion request
+  router.post(
+    '/admin/orders/:id/anonymize',
+    requireAdminAuth,
+    async (req: Request, res: Response) => {
+      const requestId = (req as any).requestId || generateRequestId();
+      try {
+        const { id } = req.params;
+        const anonymized = await getOrderService().anonymizeOrderByAdmin(id);
+        sendJson(res, 200, {
+          success: true,
+          order: anonymized,
+          message: '客户文本与联系方式已匿名化，原查询凭证已失效。',
+        });
+      } catch (err: any) {
+        if (err instanceof OrderNotFoundError) {
+          sendJson(res, 404, {
+            success: false,
+            code: 'ORDER_NOT_FOUND',
+            requestId,
+            message: err.message,
+          });
+          return;
+        }
+        if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+          sendJson(res, 503, {
+            success: false,
+            code: err.code,
+            requestId,
+            message: err.message,
+          });
+          return;
+        }
+        sendJson(res, 500, {
+          success: false,
+          requestId,
+          message: '匿名化工单失败。',
+        });
+      }
+    }
+  );
+
   // Admin: Export formula-sanitized CSV from authoritative repository
   router.get('/admin/export-csv', requireAdminAuth, async (req: Request, res: Response) => {
     const requestId = (req as any).requestId || generateRequestId();
     try {
-      const orders = await orderService.listOrdersForAdmin();
+      const orders = await getOrderService().listOrdersForAdmin();
       const csvData = exportOrdersToCSV(orders);
       sendText(res, 200, csvData, {
         'Content-Type': 'text/csv; charset=utf-8',
@@ -919,7 +1010,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       const pepper = getRequiredQueryTokenPepper();
       const now = new Date().toISOString();
       let demoToken = '';
-      const { order } = await orderService
+      const { order } = await getOrderService()
         .getRepository()
         .createOrderAtomic((orderNumber) => {
           demoToken = generateQueryToken();

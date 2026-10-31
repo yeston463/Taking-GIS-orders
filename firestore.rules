@@ -16,12 +16,12 @@ service cloud.firestore {
     }
 
     // Trusted Admin check:
-    // Relies strictly on verified Firebase Auth UID, custom claim `admin == true`,
+    // Relies strictly on verified Firebase Auth UID custom claim `admin == true`
     // or existence of the user's verified UID in the server-managed `/admins/{uid}` collection.
-    // Never trusts client-supplied email strings, unverified claims, or client-editable fields.
+    // Never trusts client-supplied email strings, unverified claims, hardcoded UIDs,
+    // or client-editable fields.
     function isTrustedAdmin() {
       return isSignedIn() && (
-        request.auth.uid == 'xewWzS52oyOTsVKxZlDUhnoedAB2' ||
         request.auth.token.get('admin', false) == true ||
         exists(/databases/$(database)/documents/admins/$(request.auth.uid))
       );

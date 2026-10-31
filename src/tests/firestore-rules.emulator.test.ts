@@ -75,12 +75,13 @@ test('P0-B Isolated Firestore Emulator Security Rules Verification (Never connec
     : false;
 
   if (!emulatorActive) {
-    // Requirement P0-B.5: When Emulator is unavailable, explicitly mark BLOCKED and NEVER fall back to live production database!
-    t.diagnostic(
-      `BLOCKED: Firebase Firestore Emulator is not active (FIRESTORE_EMULATOR_HOST=${
-        emulatorHostEnv || 'unset'
-      }). Per P0-B.5, refusing to fall back to production Firestore project (${FORBIDDEN_PROD_PROJECT_ID}). Run with: npx firebase emulators:exec --only firestore "FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run test:rules"`
-    );
+    const blockedMessage = `BLOCKED: Firebase Firestore Emulator is not active (FIRESTORE_EMULATOR_HOST=${
+      emulatorHostEnv || 'unset'
+    }). Per P0-B.5, refusing to fall back to production Firestore project (${FORBIDDEN_PROD_PROJECT_ID}). Run with: npx firebase emulators:exec --only firestore "FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 npm run test:rules"`;
+    if (process.env.REQUIRE_FIRESTORE_EMULATOR === 'true') {
+      assert.fail(blockedMessage);
+    }
+    t.skip(blockedMessage);
     return;
   }
 
