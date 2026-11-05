@@ -16,6 +16,7 @@ import {
   AdminOrderUpdateInput,
   SAFE_ALPHABET,
   PRIVACY_POLICY_VERSION,
+  ROTATION_HISTORY_LIMIT,
   generateOrderId,
   generateOrderNumber,
   generateQueryToken,
@@ -41,15 +42,23 @@ export class DatabaseUnavailableError extends Error {
   public readonly code: string;
   public readonly retryable = true;
   public readonly internalDiagnostic?: string;
+  /**
+   * True when a write may still have been committed even though the caller
+   * received an error (e.g. a transaction that outlived its await). Callers
+   * must never describe the operation as rolled back in that case.
+   */
+  public readonly outcomeUnknown: boolean;
   constructor(
     message: string,
     code = 'DATABASE_UNAVAILABLE',
-    internalDiagnostic?: string
+    internalDiagnostic?: string,
+    outcomeUnknown = false
   ) {
     super(message);
     this.name = 'DatabaseUnavailableError';
     this.code = code;
     this.internalDiagnostic = internalDiagnostic;
+    this.outcomeUnknown = outcomeUnknown;
   }
 }
 
@@ -123,6 +132,25 @@ export class DuplicateOrderConflictError extends Error {
     this.orderNumber = order.orderNumber;
     this.order = publicView;
     this.recoveryInstructions = instructions;
+  }
+}
+
+/**
+ * Raised when a rotation is retried with a key whose result has already been
+ * replaced by a later rotation. The revoked token must never be re-issued, so
+ * the caller gets an explicit 409 and the current token stays untouched.
+ */
+export class RotationSupersededError extends Error {
+  public readonly statusCode = 409;
+  public readonly code = 'ROTATION_SUPERSEDED';
+  public readonly rotationStatus = 'SUPERSEDED' as const;
+  public readonly orderNumber: string;
+  constructor(orderNumber: string) {
+    super(
+      '本次凭证重置请求已被后续轮换取代：旧凭证保持失效，当前凭证未被改写，也未签发任何凭证。如需再次重置请重新发起一次操作。'
+    );
+    this.name = 'RotationSupersededError';
+    this.orderNumber = orderNumber;
   }
 }
 
@@ -221,32 +249,142 @@ export function deriveSessionQueryToken(
 export const IDEMPOTENCY_EXPLICIT_TTL_MS = 15 * 60 * 1000; // 15 minutes for explicit key retries
 export const IDEMPOTENCY_CONTENT_WINDOW_MS = 60 * 1000; // 60 seconds for accidental tab-reopen duplicate submit
 
-const FIRESTORE_OPERATION_TIMEOUT_MS = 8000;
+const DEFAULT_FIRESTORE_OPERATION_TIMEOUT_MS = 8000;
 
-function withTimeout<T>(operation: Promise<T>, label: string): Promise<T> {
+function getFirestoreOperationTimeoutMs(): number {
+  const raw = Number.parseInt(process.env.FIRESTORE_OPERATION_TIMEOUT_MS || '', 10);
+  return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_FIRESTORE_OPERATION_TIMEOUT_MS;
+}
+
+/**
+ * Bounds how long a caller waits for Firestore. This is NOT a rollback: a
+ * transaction that resolves after the deadline may still have committed, so a
+ * timed-out write is reported as an unknown outcome instead of a failure.
+ * Callers make writes safe to retry by keying them on an idempotency key.
+ */
+export function withTimeout<T>(
+  operation: Promise<T>,
+  label: string,
+  outcome: 'read' | 'write' = 'read'
+): Promise<T> {
+  const timeoutMs = getFirestoreOperationTimeoutMs();
+
   return new Promise<T>((resolve, reject) => {
+    let settled = false;
     const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
       reject(
-        new DatabaseUnavailableError(
-          '订单数据库响应超时，请稍后重试。系统未保存任何半成品数据。',
-          'DATABASE_TIMEOUT',
-          `[FirestoreAdminOrderRepository] op=${label} timeoutMs=${FIRESTORE_OPERATION_TIMEOUT_MS}`
-        )
+        outcome === 'write'
+          ? new DatabaseUnavailableError(
+              '数据库响应超时，本次写入结果未知：数据可能已经生效。请勿按“已回滚”处理，使用同一幂等键重试或稍后核对工单状态。',
+              'DATABASE_TIMEOUT_OUTCOME_UNKNOWN',
+              `[FirestoreAdminOrderRepository] op=${label} timeoutMs=${timeoutMs} outcome=unknown`,
+              true
+            )
+          : new DatabaseUnavailableError(
+              '订单数据库响应超时，请稍后重试。',
+              'DATABASE_TIMEOUT',
+              `[FirestoreAdminOrderRepository] op=${label} timeoutMs=${timeoutMs} outcome=read`
+            )
       );
-    }, FIRESTORE_OPERATION_TIMEOUT_MS);
+    }, timeoutMs);
     timer.unref?.();
 
+    // Always attach handlers so a late rejection cannot crash the process.
     operation.then(
       (value) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         resolve(value);
       },
       (err) => {
+        if (settled) return;
+        settled = true;
         clearTimeout(timer);
         reject(err);
       }
     );
   });
+}
+
+/**
+ * Deterministically derives the query token issued by an idempotent admin token
+ * rotation. Retrying the same rotation with the same key reproduces this exact
+ * token, so a lost response can be recovered without rotating a second time.
+ */
+export function deriveRotationQueryToken(
+  orderNumber: string,
+  rotationIdempotencyKey: string,
+  overridePepper?: string,
+  rotationVersion?: number
+): string {
+  const pepper = getRequiredQueryTokenPepper(overridePepper);
+  const versionSegment =
+    typeof rotationVersion === 'number' && Number.isFinite(rotationVersion) && rotationVersion > 0
+      ? `v${rotationVersion}`
+      : '';
+  const digest = crypto
+    .createHmac('sha256', pepper)
+    .update(
+      [
+        'qk_rotation_v1',
+        orderNumber.trim().toUpperCase(),
+        rotationIdempotencyKey.trim(),
+        versionSegment,
+      ]
+        .filter(Boolean)
+        .join('|')
+    )
+    .digest();
+
+  const chars: string[] = [];
+  for (let i = 0; i < 12; i++) {
+    chars.push(SAFE_ALPHABET.charAt(digest[i] & 31));
+  }
+  return `QK-${chars.slice(0, 4).join('')}-${chars.slice(4, 8).join('')}-${chars
+    .slice(8, 12)
+    .join('')}`;
+}
+
+export const ROTATION_RECORD_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+/**
+ * Durable proof that a rotation key was consumed, written in the same Firestore
+ * transaction as the token it issued. Idempotency is decided from this record
+ * plus the order's rotation version, never from process-local state.
+ */
+export interface TokenRotationRecord {
+  orderNumber: string;
+  rotationVersion: number;
+  queryTokenHash: string;
+  issuedAt: string;
+  expiresAt: number;
+  /** Firestore TTL policy target; numeric expiresAt remains for application logic. */
+  ttlAt?: Timestamp;
+}
+
+export type RotationRepoOutcome =
+  | { status: 'ROTATED'; order: OrderItem; queryToken: string }
+  | { status: 'IDEMPOTENT_REPLAY'; order: OrderItem; queryToken: string }
+  | { status: 'SUPERSEDED'; order: OrderItem };
+
+/**
+ * Deterministically binds a rotation idempotency key to one order. Hashing keeps
+ * the document id free of caller-controlled characters and never stores the raw key.
+ */
+export function buildTokenRotationRecordId(
+  orderNumber: string,
+  rotationIdempotencyKey: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(
+      `rotation_v1|${orderNumber.trim().toUpperCase()}|${rotationIdempotencyKey.trim()}`
+    )
+    .digest('hex')
+    .slice(0, 40);
 }
 
 /**
@@ -342,6 +480,11 @@ export interface OrderRepository {
     order: OrderItem,
     policy?: 'if-newer'
   ): Promise<'created' | 'updated' | 'skipped'>;
+  rotateQueryTokenAtomic(
+    idOrNumber: string,
+    rotationIdempotencyKey: string | undefined,
+    pepper: string
+  ): Promise<RotationRepoOutcome>;
   checkRateLimit(
     key: string,
     limit: number,
@@ -432,6 +575,7 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
   private readonly ordersCollection: string;
   private readonly idempotencyCollection: string;
   private readonly rateLimitCollection: string;
+  private readonly tokenRotationCollection: string;
 
   constructor(collectionPrefix = '') {
     const serverCfg = getFirebaseServerConfig();
@@ -442,6 +586,9 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
       ? `${collectionPrefix}_idempotencyKeys`
       : 'idempotencyKeys';
     this.rateLimitCollection = collectionPrefix ? `${collectionPrefix}_rateLimits` : 'rateLimits';
+    this.tokenRotationCollection = collectionPrefix
+      ? `${collectionPrefix}_tokenRotations`
+      : 'tokenRotations';
   }
 
   private wrapFirestoreError(err: any, operation: string): never {
@@ -539,7 +686,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
 
         return { order: candidateOrder, duplicate: false, matchedMode: metaMode };
         }),
-        'createOrderAtomic'
+        'createOrderAtomic',
+        'write'
       );
     } catch (err: any) {
       if (
@@ -654,7 +802,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
         tx.set(docRef, cleanOrderForFirestore(updated));
         return updated;
         }),
-        'updateOrderAtomic'
+        'updateOrderAtomic',
+        'write'
       );
     } catch (err: any) {
       if (
@@ -704,13 +853,208 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
           );
           return snap.exists ? 'updated' : 'created';
         }),
-        'importOrderAtomic'
+        'importOrderAtomic',
+        'write'
       );
     } catch (err: any) {
       if (err instanceof DatabaseUnavailableError || err instanceof OrderValidationError) {
         throw err;
       }
       this.wrapFirestoreError(err, 'importOrderAtomic');
+    }
+  }
+
+  /**
+   * Rotates the customer query token and records the rotation key against the
+   * order's rotation version inside the *same* transaction. Retrying a consumed
+   * key therefore replays, and a key whose result was replaced by a later
+   * rotation can never re-enable the revoked token.
+   */
+  async rotateQueryTokenAtomic(
+    idOrNumber: string,
+    rotationIdempotencyKey: string | undefined,
+    pepper: string
+  ): Promise<RotationRepoOutcome> {
+    const trimmed = String(idOrNumber || '').trim();
+    const rotationKey = isValidExplicitIdempotencyKey(rotationIdempotencyKey)
+      ? rotationIdempotencyKey!.trim()
+      : undefined;
+
+    try {
+      return await withTimeout(
+        this.db.runTransaction(async (tx) => {
+          let docRef = this.db.collection(this.ordersCollection).doc(trimmed.toUpperCase());
+          let snap = await tx.get(docRef);
+          if (!snap.exists) {
+            const qSnap = await tx.get(
+              this.db.collection(this.ordersCollection).where('id', '==', trimmed).limit(1)
+            );
+            if (qSnap.empty) {
+              throw new OrderNotFoundError();
+            }
+            docRef = qSnap.docs[0].ref;
+            snap = qSnap.docs[0];
+          }
+
+          const existing = snap.data() as OrderItem;
+          if (existing.anonymizedAt) {
+            throw new OrderValidationError('该工单已匿名化，无法再签发查询凭证。');
+          }
+
+          const canonicalNumber = String(existing.orderNumber || '').trim().toUpperCase();
+
+          const currentVersion =
+            typeof existing.rotationVersion === 'number' &&
+            Number.isFinite(existing.rotationVersion)
+              ? existing.rotationVersion
+              : 0;
+
+          if (rotationKey) {
+            const recordId = buildTokenRotationRecordId(canonicalNumber, rotationKey);
+            const recordRef = this.db
+              .collection(this.tokenRotationCollection)
+              .doc(recordId);
+            const recordSnap = await tx.get(recordRef);
+
+            // Step 1: Durable rotation record in /tokenRotations (if not yet deleted by TTL)
+            if (recordSnap.exists) {
+              const record = recordSnap.data() as TokenRotationRecord;
+              const replayToken = deriveRotationQueryToken(
+                canonicalNumber,
+                rotationKey,
+                pepper,
+                record.rotationVersion
+              );
+              const replayHash = hashQueryToken(canonicalNumber, replayToken, pepper);
+              const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+              const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+
+              if (record.queryTokenHash !== replayHash && record.queryTokenHash !== legacyHash) {
+                // Pepper rotated or the record was tampered with: never deliver a token.
+                throw new DatabaseUnavailableError(
+                  '轮换记录与当前密钥配置不一致，已拒绝签发查询凭证。',
+                  'ROTATION_RECORD_MISMATCH'
+                );
+              }
+              const validToken = record.queryTokenHash === replayHash ? replayToken : legacyToken;
+              if (
+                record.rotationVersion === currentVersion &&
+                existing.queryTokenHash === record.queryTokenHash
+              ) {
+                return {
+                  status: 'IDEMPOTENT_REPLAY',
+                  order: existing,
+                  queryToken: validToken,
+                };
+              }
+              return { status: 'SUPERSEDED', order: existing };
+            }
+
+            // Step 2: Proof retained on the order itself (never deleted by TTL).
+            // Binds the consumed key to the rotation version at which it was applied.
+            const consumedVersion = existing.consumedRotationKeys?.[recordId];
+            if (typeof consumedVersion === 'number') {
+              const replayToken = deriveRotationQueryToken(
+                canonicalNumber,
+                rotationKey,
+                pepper,
+                consumedVersion
+              );
+              const replayHash = hashQueryToken(canonicalNumber, replayToken, pepper);
+              const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+              const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+
+              if (consumedVersion === currentVersion) {
+                if (existing.queryTokenHash === replayHash) {
+                  return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: replayToken };
+                }
+                if (existing.queryTokenHash === legacyHash) {
+                  return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: legacyToken };
+                }
+                throw new DatabaseUnavailableError(
+                  '轮换记录与当前密钥配置不一致，已拒绝签发查询凭证。',
+                  'ROTATION_RECORD_MISMATCH'
+                );
+              }
+              return { status: 'SUPERSEDED', order: existing };
+            }
+
+            // Step 3: Record aged out (TTL) or predates this scheme: fall back to the
+            // order's own version evidence so a revoked token stays revoked.
+            const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+            const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+            if (existing.queryTokenHash === legacyHash) {
+              return {
+                status: 'IDEMPOTENT_REPLAY',
+                order: existing,
+                queryToken: legacyToken,
+              };
+            }
+            if ((existing.rotationHistory || []).includes(legacyHash)) {
+              return { status: 'SUPERSEDED', order: existing };
+            }
+          }
+
+          const nextVersion = currentVersion + 1;
+          const token = rotationKey
+            ? deriveRotationQueryToken(canonicalNumber, rotationKey, pepper, nextVersion)
+            : generateQueryToken();
+          const tokenHash = hashQueryToken(canonicalNumber, token, pepper);
+          const now = new Date().toISOString();
+          const nowMs = Date.now();
+          const history = [
+            ...(existing.queryTokenHash ? [existing.queryTokenHash] : []),
+            ...(existing.rotationHistory || []),
+          ].slice(0, ROTATION_HISTORY_LIMIT);
+
+          const updated: OrderItem = {
+            ...existing,
+            queryTokenHash: tokenHash,
+            queryTokenUpdatedAt: now,
+            rotationVersion: nextVersion,
+            rotationHistory: history,
+            consumedRotationKeys: rotationKey
+              ? {
+                  ...(existing.consumedRotationKeys || {}),
+                  [buildTokenRotationRecordId(canonicalNumber, rotationKey)]: nextVersion,
+                }
+              : existing.consumedRotationKeys,
+            updatedAt: now,
+          };
+
+          tx.set(docRef, cleanOrderForFirestore(updated));
+
+          if (rotationKey) {
+            tx.set(
+              this.db
+                .collection(this.tokenRotationCollection)
+                .doc(buildTokenRotationRecordId(canonicalNumber, rotationKey)),
+              {
+                orderNumber: canonicalNumber,
+                rotationVersion: nextVersion,
+                queryTokenHash: tokenHash,
+                issuedAt: now,
+                expiresAt: nowMs + ROTATION_RECORD_TTL_MS,
+                ttlAt: Timestamp.fromMillis(nowMs + ROTATION_RECORD_TTL_MS),
+              } satisfies TokenRotationRecord
+            );
+          }
+
+          return { status: 'ROTATED', order: updated, queryToken: token };
+        }),
+        'rotateQueryTokenAtomic',
+        'write'
+      );
+    } catch (err: any) {
+      if (
+        err instanceof OrderNotFoundError ||
+        err instanceof OrderValidationError ||
+        err instanceof DatabaseUnavailableError ||
+        err instanceof ConfigurationError
+      ) {
+        throw err;
+      }
+      this.wrapFirestoreError(err, 'rotateQueryTokenAtomic');
     }
   }
 
@@ -792,7 +1136,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
             retryAfterSeconds: 0,
           };
           }),
-          'checkRateLimitDetailed'
+          'checkRateLimitDetailed',
+          'write'
         );
 
         recordL1Observation(safeKey, result.count, result.windowStart);
@@ -805,7 +1150,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
       } catch (err: any) {
         lastErr = err;
         const category =
-          err instanceof DatabaseUnavailableError && err.code === 'DATABASE_TIMEOUT'
+          err instanceof DatabaseUnavailableError &&
+          err.code.startsWith('DATABASE_TIMEOUT')
             ? 'TIMEOUT'
             : classifyFirestoreRateLimitError(err);
         if (category === 'TRANSACTION_CONFLICT' && attempt < maxAttempts) {
@@ -817,7 +1163,8 @@ export class FirestoreAdminOrderRepository implements OrderRepository {
     }
 
     const category =
-      lastErr instanceof DatabaseUnavailableError && lastErr.code === 'DATABASE_TIMEOUT'
+      lastErr instanceof DatabaseUnavailableError &&
+      String(lastErr?.code || '').startsWith('DATABASE_TIMEOUT')
         ? 'TIMEOUT'
         : classifyFirestoreRateLimitError(lastErr);
     console.error(
@@ -851,6 +1198,7 @@ export class IsolatedTestOrderRepository implements OrderRepository {
   private readonly storageFilePath: string;
   private simulateFailure = false;
   private simulateRateLimitFailureCategory: RateLimitFailureCategory | null = null;
+  private simulateOutcomeUnknownOnce = false;
   private mutex: Promise<void> = Promise.resolve();
 
   constructor(storageFilePath?: string) {
@@ -869,6 +1217,15 @@ export class IsolatedTestOrderRepository implements OrderRepository {
 
   public setSimulateRateLimitFailure(category: RateLimitFailureCategory | null) {
     this.simulateRateLimitFailureCategory = category;
+  }
+
+  /**
+   * Test-only fault injection: the next write is persisted and *then* reported as
+   * an unknown outcome, modelling a transaction that commits after the caller's
+   * deadline (a timed-out request is not a rolled-back request).
+   */
+  public setSimulateOutcomeUnknownOnce(value: boolean) {
+    this.simulateOutcomeUnknownOnce = value;
   }
 
   private async withLock<T>(fn: () => Promise<T> | T): Promise<T> {
@@ -896,6 +1253,7 @@ export class IsolatedTestOrderRepository implements OrderRepository {
     orders: Record<string, OrderItem>;
     idempotency: Record<string, IdempotencyRecord | string>;
     rateLimits: Record<string, { count: number; windowStart: number } | number[]>;
+    rotations: Record<string, TokenRotationRecord>;
   } {
     try {
       if (fs.existsSync(this.storageFilePath)) {
@@ -905,18 +1263,20 @@ export class IsolatedTestOrderRepository implements OrderRepository {
           orders: parsed.orders || {},
           idempotency: parsed.idempotency || {},
           rateLimits: parsed.rateLimits || {},
+          rotations: parsed.rotations || {},
         };
       }
     } catch {
       // start fresh if corrupted
     }
-    return { orders: {}, idempotency: {}, rateLimits: {} };
+    return { orders: {}, idempotency: {}, rateLimits: {}, rotations: {} };
   }
 
   private writeState(state: {
     orders: Record<string, OrderItem>;
     idempotency: Record<string, IdempotencyRecord | string>;
     rateLimits: Record<string, { count: number; windowStart: number } | number[]>;
+    rotations: Record<string, TokenRotationRecord>;
   }) {
     const dir = path.dirname(this.storageFilePath);
     if (!fs.existsSync(dir)) {
@@ -1041,8 +1401,183 @@ export class IsolatedTestOrderRepository implements OrderRepository {
       const updated = updater(existing);
       state.orders[updated.orderNumber] = cleanOrderForFirestore(updated) as OrderItem;
       this.writeState(state);
+
+      this.throwIfOutcomeUnknownRequested();
+
       return updated;
     });
+  }
+
+  /**
+   * Mirrors FirestoreAdminOrderRepository.rotateQueryTokenAtomic: the rotation key is
+   * recorded against the order's rotation version inside the same locked write, so a
+   * superseded key is refused instead of re-enabling a revoked token.
+   */
+  async rotateQueryTokenAtomic(
+    idOrNumber: string,
+    rotationIdempotencyKey: string | undefined,
+    pepper: string
+  ): Promise<RotationRepoOutcome> {
+    return this.withLock(() => {
+      const state = this.readState();
+      const trimmed = String(idOrNumber || '').trim();
+      let existing = state.orders[trimmed.toUpperCase()];
+      if (!existing) {
+        existing = Object.values(state.orders).find((o) => o.id === trimmed)!;
+      }
+      if (!existing) {
+        throw new OrderNotFoundError();
+      }
+      if (existing.anonymizedAt) {
+        throw new OrderValidationError('该工单已匿名化，无法再签发查询凭证。');
+      }
+
+      const canonicalNumber = String(existing.orderNumber || '').trim().toUpperCase();
+      const currentVersion =
+        typeof existing.rotationVersion === 'number' && Number.isFinite(existing.rotationVersion)
+          ? existing.rotationVersion
+          : 0;
+
+      const rotationKey = isValidExplicitIdempotencyKey(rotationIdempotencyKey)
+        ? rotationIdempotencyKey!.trim()
+        : undefined;
+
+      if (rotationKey) {
+        const recordId = buildTokenRotationRecordId(canonicalNumber, rotationKey);
+        const record = state.rotations[recordId];
+
+        // Step 1: Durable rotation record in state.rotations (if not yet deleted by TTL)
+        if (record) {
+          const replayToken = deriveRotationQueryToken(
+            canonicalNumber,
+            rotationKey,
+            pepper,
+            record.rotationVersion
+          );
+          const replayHash = hashQueryToken(canonicalNumber, replayToken, pepper);
+          const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+          const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+
+          if (record.queryTokenHash !== replayHash && record.queryTokenHash !== legacyHash) {
+            throw new DatabaseUnavailableError(
+              '轮换记录与当前密钥配置不一致，已拒绝签发查询凭证。',
+              'ROTATION_RECORD_MISMATCH'
+            );
+          }
+          const validToken = record.queryTokenHash === replayHash ? replayToken : legacyToken;
+          if (
+            record.rotationVersion === currentVersion &&
+            existing.queryTokenHash === record.queryTokenHash
+          ) {
+            return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: validToken };
+          }
+          return { status: 'SUPERSEDED', order: existing };
+        }
+
+        // Step 2: Proof retained on the order itself (never deleted by TTL)
+        const consumedVersion = existing.consumedRotationKeys?.[recordId];
+        if (typeof consumedVersion === 'number') {
+          const replayToken = deriveRotationQueryToken(
+            canonicalNumber,
+            rotationKey,
+            pepper,
+            consumedVersion
+          );
+          const replayHash = hashQueryToken(canonicalNumber, replayToken, pepper);
+          const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+          const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+
+          if (consumedVersion === currentVersion) {
+            if (existing.queryTokenHash === replayHash) {
+              return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: replayToken };
+            }
+            if (existing.queryTokenHash === legacyHash) {
+              return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: legacyToken };
+            }
+            throw new DatabaseUnavailableError(
+              '轮换记录与当前密钥配置不一致，已拒绝签发查询凭证。',
+              'ROTATION_RECORD_MISMATCH'
+            );
+          }
+          return { status: 'SUPERSEDED', order: existing };
+        }
+
+        // Step 3: Record aged out (TTL) or predates this scheme
+        const legacyToken = deriveRotationQueryToken(canonicalNumber, rotationKey, pepper);
+        const legacyHash = hashQueryToken(canonicalNumber, legacyToken, pepper);
+        if (existing.queryTokenHash === legacyHash) {
+          return { status: 'IDEMPOTENT_REPLAY', order: existing, queryToken: legacyToken };
+        }
+        if ((existing.rotationHistory || []).includes(legacyHash)) {
+          return { status: 'SUPERSEDED', order: existing };
+        }
+      }
+
+      const nextVersion = currentVersion + 1;
+      const token = rotationKey
+        ? deriveRotationQueryToken(canonicalNumber, rotationKey, pepper, nextVersion)
+        : generateQueryToken();
+      const tokenHash = hashQueryToken(canonicalNumber, token, pepper);
+      const now = new Date().toISOString();
+      const history = [
+        ...(existing.queryTokenHash ? [existing.queryTokenHash] : []),
+        ...(existing.rotationHistory || []),
+      ].slice(0, ROTATION_HISTORY_LIMIT);
+
+      const updated: OrderItem = {
+        ...existing,
+        queryTokenHash: tokenHash,
+        queryTokenUpdatedAt: now,
+        rotationVersion: nextVersion,
+        rotationHistory: history,
+        consumedRotationKeys: rotationKey
+          ? {
+              ...(existing.consumedRotationKeys || {}),
+              [buildTokenRotationRecordId(canonicalNumber, rotationKey)]: nextVersion,
+            }
+          : existing.consumedRotationKeys,
+        updatedAt: now,
+      };
+
+      state.orders[canonicalNumber] = cleanOrderForFirestore(updated) as OrderItem;
+
+      if (rotationKey) {
+        state.rotations[buildTokenRotationRecordId(canonicalNumber, rotationKey)] = {
+          orderNumber: canonicalNumber,
+          rotationVersion: nextVersion,
+          queryTokenHash: tokenHash,
+          issuedAt: now,
+          expiresAt: Date.now() + ROTATION_RECORD_TTL_MS,
+        };
+      }
+
+      this.writeState(state);
+
+      this.throwIfOutcomeUnknownRequested();
+
+      return { status: 'ROTATED', order: updated, queryToken: token };
+    });
+  }
+
+  deleteRotationRecordForTests(orderNumber: string, rotationKey: string): void {
+    this.withLock(() => {
+      const state = this.readState();
+      const canonicalNumber = String(orderNumber || '').trim().toUpperCase();
+      const recordId = buildTokenRotationRecordId(canonicalNumber, rotationKey);
+      delete state.rotations[recordId];
+      this.writeState(state);
+    });
+  }
+
+  private throwIfOutcomeUnknownRequested() {
+    if (!this.simulateOutcomeUnknownOnce) return;
+    this.simulateOutcomeUnknownOnce = false;
+    throw new DatabaseUnavailableError(
+      '数据库响应超时，本次写入结果未知：数据可能已经生效。请勿按“已回滚”处理，使用同一幂等键重试或稍后核对工单状态。',
+      'DATABASE_TIMEOUT_OUTCOME_UNKNOWN',
+      '[IsolatedTestOrderRepository] committed write reported as unknown outcome',
+      true
+    );
   }
 
   async importOrderAtomic(
@@ -1361,6 +1896,14 @@ export class OrderService {
     input: AdminOrderUpdateInput
   ): Promise<OrderItem> {
     return this.repo.updateOrderAtomic(idOrNumber, (existing) => {
+      // Checked inside the transaction: an admin PATCH that was issued before
+      // anonymization must not resurrect the customer data that was cleared.
+      if (existing.anonymizedAt) {
+        throw new OrderValidationError(
+          '该工单已匿名化，禁止再次写入内容或备注；如需继续服务请新建工单。'
+        );
+      }
+
       const targetStatus = input.status !== undefined ? input.status : existing.status;
       const check = validateAdminOrderUpdate(
         {
@@ -1394,8 +1937,18 @@ export class OrderService {
     });
   }
 
-  async anonymizeOrderByAdmin(idOrNumber: string): Promise<OrderItem> {
-    return this.repo.updateOrderAtomic(idOrNumber, (existing) => {
+  async anonymizeOrderByAdmin(
+    idOrNumber: string
+  ): Promise<{ order: OrderItem; alreadyAnonymized: boolean }> {
+    let alreadyAnonymized = false;
+    const updated = await this.repo.updateOrderAtomic(idOrNumber, (existing) => {
+      // Anonymization is idempotent: retrying after a lost response reports the
+      // existing anonymized state instead of failing or rewriting anything.
+      if (existing.anonymizedAt) {
+        alreadyAnonymized = true;
+        return existing;
+      }
+
       const now = new Date().toISOString();
       return {
         ...existing,
@@ -1410,31 +1963,49 @@ export class OrderService {
         clientNotes: '该工单已按客户要求匿名化。',
         queryTokenHash: undefined,
         queryTokenUpdatedAt: now,
+        anonymizedAt: now,
         updatedAt: now,
       };
     });
+
+    return { order: updated, alreadyAnonymized };
   }
 
+  /**
+   * Rotates the customer query token through the repository's atomic rotation
+   * routine, which records the rotation key against the order's rotation version.
+   * Retrying a key whose rotation is still current replays the original token;
+   * retrying a key that a later rotation superseded throws instead of re-issuing
+   * a revoked credential.
+   */
   async rotateOrderQueryTokenByAdmin(
-    idOrNumber: string
-  ): Promise<{ orderNumber: string; newQueryToken: string; updatedAt: string }> {
+    idOrNumber: string,
+    rotationIdempotencyKey?: string
+  ): Promise<{
+    orderNumber: string;
+    newQueryToken: string;
+    updatedAt: string;
+    rotationStatus: 'ROTATED' | 'IDEMPOTENT_REPLAY';
+    rotationVersion: number;
+  }> {
     const pepper = getRequiredQueryTokenPepper();
-    let newQueryToken = '';
-    const updated = await this.repo.updateOrderAtomic(idOrNumber, (existing) => {
-      newQueryToken = generateQueryToken();
-      const now = new Date().toISOString();
-      return {
-        ...existing,
-        queryTokenHash: hashQueryToken(existing.orderNumber, newQueryToken, pepper),
-        queryTokenUpdatedAt: now,
-        updatedAt: now,
-      };
-    });
+
+    const outcome = await this.repo.rotateQueryTokenAtomic(
+      idOrNumber,
+      rotationIdempotencyKey,
+      pepper
+    );
+
+    if (outcome.status === 'SUPERSEDED') {
+      throw new RotationSupersededError(outcome.order.orderNumber);
+    }
 
     return {
-      orderNumber: updated.orderNumber,
-      newQueryToken,
-      updatedAt: updated.updatedAt,
+      orderNumber: outcome.order.orderNumber,
+      newQueryToken: outcome.queryToken,
+      updatedAt: outcome.order.updatedAt,
+      rotationStatus: outcome.status === 'IDEMPOTENT_REPLAY' ? 'IDEMPOTENT_REPLAY' : 'ROTATED',
+      rotationVersion: outcome.order.rotationVersion ?? 0,
     };
   }
 }

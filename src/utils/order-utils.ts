@@ -37,8 +37,12 @@ export interface OrderItem {
   clientNotes?: string;
   queryTokenHash?: string;
   queryTokenUpdatedAt?: string;
+  rotationVersion?: number;
+  rotationHistory?: string[];
+  consumedRotationKeys?: Record<string, number>;
   privacyConsentAt?: string;
   privacyConsentVersion?: string;
+  anonymizedAt?: string;
   isDemo?: boolean;
   createdAt: string;
   updatedAt: string;
@@ -119,6 +123,8 @@ export function isAllowedStatusTransition(from: OrderStatus, to: OrderStatus): b
 
 export const SAFE_ALPHABET = '23456789ABCDEFGHJKLMNPQRSTUVWXYZ';
 export const PRIVACY_POLICY_VERSION = '2026-10-31';
+/** Revoked token hashes kept on the order so an expired rotation record cannot re-enable an old token. */
+export const ROTATION_HISTORY_LIMIT = 12;
 
 export class CryptoUnavailableError extends Error {
   public readonly code = 'CSPRNG_UNAVAILABLE';
@@ -588,11 +594,33 @@ export function cleanOrderForFirestore(order: OrderItem): Record<string, any> {
   if (order.queryTokenUpdatedAt) {
     docData.queryTokenUpdatedAt = order.queryTokenUpdatedAt;
   }
+  if (typeof order.rotationVersion === 'number' && Number.isFinite(order.rotationVersion)) {
+    docData.rotationVersion = order.rotationVersion;
+  }
+  if (Array.isArray(order.rotationHistory) && order.rotationHistory.length > 0) {
+    docData.rotationHistory = order.rotationHistory
+      .filter((h): h is string => typeof h === 'string' && h.length === 64)
+      .slice(0, ROTATION_HISTORY_LIMIT);
+  }
   if (order.privacyConsentAt) {
     docData.privacyConsentAt = order.privacyConsentAt;
   }
   if (order.privacyConsentVersion) {
     docData.privacyConsentVersion = order.privacyConsentVersion;
+  }
+  if (order.consumedRotationKeys && typeof order.consumedRotationKeys === 'object' && !Array.isArray(order.consumedRotationKeys)) {
+    const valid: Record<string, number> = {};
+    for (const [k, v] of Object.entries(order.consumedRotationKeys)) {
+      if (typeof k === 'string' && typeof v === 'number' && Number.isFinite(v)) {
+        valid[k] = v;
+      }
+    }
+    if (Object.keys(valid).length > 0) {
+      docData.consumedRotationKeys = valid;
+    }
+  }
+  if (order.anonymizedAt) {
+    docData.anonymizedAt = order.anonymizedAt;
   }
   if (typeof order.isDemo === 'boolean') {
     docData.isDemo = order.isDemo;

@@ -29,6 +29,7 @@ import {
   formatRMB,
   filterAndSortOrders,
   validateAdminOrderUpdate,
+  generateClientIdempotencyKey,
 } from '../utils/order-utils.ts';
 
 export const AdminPage: React.FC = () => {
@@ -77,6 +78,12 @@ export const AdminPage: React.FC = () => {
   const [rotatedTokenResult, setRotatedTokenResult] = useState<string | null>(null);
   const [copiedRotatedToken, setCopiedRotatedToken] = useState(false);
   const [isAnonymizing, setIsAnonymizing] = useState(false);
+  // Reused across retries so a lost rotation response can be recovered instead of
+  // rotating a second time; cleared once the result is delivered or the modal closes.
+  const [rotationAttemptKey, setRotationAttemptKey] = useState<string | null>(null);
+
+  // Save / rotate / anonymize are mutually exclusive while any one is in flight.
+  const modalBusy = isSaving || isRotatingToken || isAnonymizing;
 
   // Listen to Firebase Auth state & resolve redirect sign-in results
   useEffect(() => {
@@ -248,11 +255,14 @@ export const AdminPage: React.FC = () => {
     setModalError(null);
     setSaveSuccessMsg(null);
     setRotatedTokenResult(null);
+    setRotationAttemptKey(null);
+    // Never keep a previous order's draft in the form between modal sessions.
+    setModalForm({ status: 'pending_review', manualQuote: '', adminNotes: '', clientNotes: '' });
   };
 
   const handleSaveModal = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!editingOrder || !currentUser) return;
+    if (!editingOrder || !currentUser || modalBusy) return;
 
     setModalError(null);
     setSaveSuccessMsg(null);
@@ -319,7 +329,7 @@ export const AdminPage: React.FC = () => {
   };
 
   const handleRotateQueryToken = async () => {
-    if (!editingOrder || !currentUser) return;
+    if (!editingOrder || !currentUser || modalBusy) return;
     if (
       !window.confirm(
         '重置后客户当前保存的查询凭证会立即失效。请确认已通过预留渠道核实客户身份，是否继续？'
@@ -327,6 +337,11 @@ export const AdminPage: React.FC = () => {
     ) {
       return;
     }
+
+    // Reuse the key from an earlier failed attempt so a retry replays that rotation.
+    const attemptKey = rotationAttemptKey ?? generateClientIdempotencyKey();
+    setRotationAttemptKey(attemptKey);
+
     setIsRotatingToken(true);
     setModalError(null);
     setRotatedTokenResult(null);
@@ -344,24 +359,43 @@ export const AdminPage: React.FC = () => {
           headers: {
             'Content-Type': 'application/json',
             'X-Firebase-Auth': `Bearer ${idToken}`,
+            'X-Idempotency-Key': attemptKey,
           },
           body: JSON.stringify({}),
         }
       );
       const data = await parseJsonResponse(res);
       if (!res.ok || !data.success) {
-        throw new Error(data.message || '重置查询凭证失败');
+        const err: any = new Error(data.message || '重置查询凭证失败');
+        err.code = data.code;
+        err.status = res.status;
+        throw err;
       }
       setRotatedTokenResult(data.newQueryToken);
+      // The token is now delivered; a later click must start a fresh rotation.
+      setRotationAttemptKey(null);
     } catch (err: any) {
-      setModalError(err.message || '重置查询凭证失败');
+      if (err?.code === 'ROTATION_SUPERSEDED') {
+        // This key's rotation was replaced by a later one; retrying it can never
+        // succeed, so drop it and let the next click start a fresh operation.
+        setRotationAttemptKey(null);
+        setModalError(
+          err.message ||
+            '本次凭证重置已被后续轮换取代，旧凭证仍无效且当前凭证未被改写。请重新发起一次凭证重置。'
+        );
+      } else {
+        // Keep rotationAttemptKey so the next click recovers the same result
+        // instead of rotating again and destroying an undelivered token.
+        setModalError(err.message || '重置查询凭证失败');
+      }
     } finally {
       setIsRotatingToken(false);
     }
   };
 
   const handleAnonymizeOrder = async () => {
-    if (!editingOrder || !currentUser) return;
+    if (!editingOrder || !currentUser || modalBusy) return;
+    const targetOrderNumber = editingOrder.orderNumber;
     if (
       !window.confirm(
         '匿名化会清除客户联系方式、需求正文、研究区和内部备注，并立即作废查询凭证。此操作不可撤销，是否继续？'
@@ -380,7 +414,7 @@ export const AdminPage: React.FC = () => {
         throw new Error('未获取到有效登录凭证，请重新登录');
       }
       const res = await fetch(
-        `/api/admin/orders/${encodeURIComponent(editingOrder.orderNumber)}/anonymize`,
+        `/api/admin/orders/${encodeURIComponent(targetOrderNumber)}/anonymize`,
         {
           method: 'POST',
           headers: { 'X-Firebase-Auth': `Bearer ${idToken}` },
@@ -392,13 +426,17 @@ export const AdminPage: React.FC = () => {
       }
       const updatedOrder: OrderItem = data.order;
       setOrders((prev) =>
-        prev.map((o) => (o.orderNumber === editingOrder.orderNumber ? updatedOrder : o))
+        prev.map((o) => (o.orderNumber === targetOrderNumber ? updatedOrder : o))
       );
-      setEditingOrder(updatedOrder);
-      setSaveSuccessMsg('客户文本与联系方式已匿名化，原查询凭证已失效。');
-      setTimeout(() => {
-        handleCloseModal();
-      }, 1200);
+      // Close immediately and drop the pre-anonymization draft so no stale note
+      // can be saved back over the cleared record.
+      handleCloseModal();
+      setBannerNotice({
+        type: 'success',
+        text: data.alreadyAnonymized
+          ? `工单 ${targetOrderNumber} 此前已匿名化，本次未重复改写。`
+          : `工单 ${targetOrderNumber} 已匿名化：联系方式与正文已清除，原查询凭证失效，后续更新已锁定。`,
+      });
     } catch (err: any) {
       setModalError(err.message || '匿名化工单失败');
     } finally {
@@ -975,7 +1013,7 @@ export const AdminPage: React.FC = () => {
                       </div>
                       <button
                         type="button"
-                        disabled={isRotatingToken}
+                        disabled={modalBusy}
                         onClick={handleRotateQueryToken}
                         className="px-3 py-1.5 rounded-xl bg-teal-600 hover:bg-teal-500 disabled:bg-slate-700 text-white font-semibold text-xs transition cursor-pointer shrink-0"
                       >
@@ -1022,7 +1060,7 @@ export const AdminPage: React.FC = () => {
                       </div>
                       <button
                         type="button"
-                        disabled={isAnonymizing || isRotatingToken}
+                        disabled={modalBusy}
                         onClick={handleAnonymizeOrder}
                         className="px-3 py-1.5 rounded-xl bg-rose-700 hover:bg-rose-800 disabled:bg-rose-300 text-white font-semibold text-xs transition cursor-pointer shrink-0"
                       >
@@ -1133,7 +1171,7 @@ export const AdminPage: React.FC = () => {
                     </button>
                     <button
                       type="submit"
-                      disabled={isSaving}
+                      disabled={modalBusy}
                       className="px-6 py-2 rounded-xl bg-teal-600 hover:bg-teal-700 disabled:bg-teal-400 text-white font-bold transition cursor-pointer shadow-sm flex items-center gap-1.5"
                     >
                       {isSaving ? (

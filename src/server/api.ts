@@ -28,6 +28,7 @@ import {
   DuplicateOrderConflictError,
   OrderValidationError,
   OrderNotFoundError,
+  RotationSupersededError,
   hashQueryToken,
 } from './order-service.ts';
 
@@ -159,6 +160,20 @@ function sendText(res: any, status: number, text: string, headers: Record<string
   } else {
     res.end(text);
   }
+}
+
+function sendServiceUnavailable(res: any, err: any, requestId?: string): void {
+  const outcomeUnknown = err?.outcomeUnknown === true;
+  sendJson(res, 503, {
+    success: false,
+    code: err?.code,
+    requestId,
+    retryable: true,
+    // A timed-out write is not a rolled-back write: surface it so clients retry
+    // with the same idempotency key instead of assuming the data was discarded.
+    ...(outcomeUnknown ? { outcomeUnknown: true } : {}),
+    message: err?.message,
+  });
 }
 
 class PayloadTooLargeError extends Error {
@@ -348,13 +363,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       decoded = await verifyIdTokenFn(token);
     } catch (err: any) {
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          isAdmin: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 401, {
@@ -444,12 +453,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       });
     } catch (err: any) {
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 500, {
@@ -800,12 +804,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       });
     } catch (err: any) {
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 500, {
@@ -862,12 +861,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
         return;
       }
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 500, {
@@ -878,7 +872,9 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
     }
   });
 
-  // Admin: Rotate / Re-issue customer queryToken after manual identity verification
+  // Admin: Rotate / Re-issue customer queryToken after manual identity verification.
+  // Send X-Idempotency-Key to make the rotation retryable: the same key replays the
+  // same token instead of rotating twice after a lost or timed-out response.
   router.post(
     '/admin/orders/:id/rotate-token',
     requireAdminAuth,
@@ -886,14 +882,23 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       const requestId = (req as any).requestId || generateRequestId();
       try {
         const { id } = req.params;
-        const rotated = await getOrderService().rotateOrderQueryTokenByAdmin(id);
+        const rotationKey =
+          typeof req.headers['x-idempotency-key'] === 'string'
+            ? req.headers['x-idempotency-key']
+            : undefined;
+        const rotated = await getOrderService().rotateOrderQueryTokenByAdmin(id, rotationKey);
+        const isReplay = rotated.rotationStatus === 'IDEMPOTENT_REPLAY';
         sendJson(res, 200, {
           success: true,
           orderNumber: rotated.orderNumber,
           newQueryToken: rotated.newQueryToken,
           updatedAt: rotated.updatedAt,
-          message:
-            '已成功重置并签发新的专属查询凭证，旧凭证已立即失效。请通过人工核实的客户预留渠道发送给客户。',
+          rotationStatus: rotated.rotationStatus,
+          rotationVersion: rotated.rotationVersion,
+          requestId,
+          message: isReplay
+            ? '已识别为同一次凭证重置的重试（未重复轮换），已恢复本次签发的查询凭证，请立即复制保存。'
+            : '已成功重置并签发新的专属查询凭证，旧凭证已立即失效。请通过人工核实的客户预留渠道发送给客户。',
         });
       } catch (err: any) {
         if (err instanceof OrderNotFoundError) {
@@ -905,13 +910,28 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
           });
           return;
         }
-        if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-          sendJson(res, 503, {
+        if (err instanceof RotationSupersededError) {
+          sendJson(res, 409, {
             success: false,
             code: err.code,
+            rotationStatus: err.rotationStatus,
+            orderNumber: err.orderNumber,
             requestId,
             message: err.message,
           });
+          return;
+        }
+        if (err instanceof OrderValidationError) {
+          sendJson(res, 400, {
+            success: false,
+            code: 'ROTATE_NOT_ALLOWED',
+            requestId,
+            message: err.message,
+          });
+          return;
+        }
+        if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+          sendServiceUnavailable(res, err, requestId);
           return;
         }
         sendJson(res, 500, {
@@ -931,11 +951,15 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       const requestId = (req as any).requestId || generateRequestId();
       try {
         const { id } = req.params;
-        const anonymized = await getOrderService().anonymizeOrderByAdmin(id);
+        const { order, alreadyAnonymized } = await getOrderService().anonymizeOrderByAdmin(id);
         sendJson(res, 200, {
           success: true,
-          order: anonymized,
-          message: '客户文本与联系方式已匿名化，原查询凭证已失效。',
+          order,
+          alreadyAnonymized,
+          requestId,
+          message: alreadyAnonymized
+            ? '该工单此前已匿名化，未重复改写（本次为重试结果）。'
+            : '客户文本与联系方式已匿名化，原查询凭证已失效，后续更新已被锁定。',
         });
       } catch (err: any) {
         if (err instanceof OrderNotFoundError) {
@@ -947,13 +971,17 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
           });
           return;
         }
-        if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-          sendJson(res, 503, {
+        if (err instanceof OrderValidationError) {
+          sendJson(res, 400, {
             success: false,
-            code: err.code,
+            code: 'ANONYMIZE_NOT_ALLOWED',
             requestId,
             message: err.message,
           });
+          return;
+        }
+        if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
+          sendServiceUnavailable(res, err, requestId);
           return;
         }
         sendJson(res, 500, {
@@ -977,12 +1005,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       });
     } catch (err: any) {
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 500, {
@@ -1046,12 +1069,7 @@ export function createApiRouter(options?: ApiRouterOptions): Router {
       });
     } catch (err: any) {
       if (err instanceof ConfigurationError || err instanceof DatabaseUnavailableError) {
-        sendJson(res, 503, {
-          success: false,
-          code: err.code,
-          requestId,
-          message: err.message,
-        });
+        sendServiceUnavailable(res, err, requestId);
         return;
       }
       sendJson(res, 500, {

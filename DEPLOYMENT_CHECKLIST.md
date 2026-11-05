@@ -32,7 +32,9 @@
 
 ### Firestore TTL 清理（控制存储成本）
 
-服务端会在 `/rateLimits/{key}` 与 `/idempotencyKeys/{key}` 写入 `ttlAt`（Firestore Timestamp）字段。请在 Firestore 控制台为这两个集合启用 TTL 策略，字段选择 `ttlAt`，使过期限流/幂等记录自动删除，避免公开接口被随机 key 长期占用存储。限流与幂等业务逻辑仍读取数值型 `expiresAt`，TTL 只负责清理。
+服务端会在 `/rateLimits/{key}`、`/idempotencyKeys/{key}` 与 `/tokenRotations/{key}` 写入 `ttlAt`（Firestore Timestamp）字段。请在 Firestore 控制台为这三个集合启用 TTL 策略，字段选择 `ttlAt`，使过期限流/幂等/凭证轮换记录自动删除，避免公开接口被随机 key 长期占用存储。限流与幂等业务逻辑仍读取数值型 `expiresAt`，TTL 只负责清理。
+
+`/tokenRotations` 的 TTL 为 30 天（`ROTATION_RECORD_TTL_MS`）。为防止记录随 TTL 清除且旧哈希挤出历史窗口后重试旧键导致旧凭证复活，工单自身持久化保存 `consumedRotationKeys`（已消费键 ID 到版本的映射，永不随 TTL 删除），且凭证派生绑定所属轮换版本。即使 `/tokenRotations` 记录被 TTL 删除，重试已消费旧键仍会被直接判定为 `409 ROTATION_SUPERSEDED`，最新凭证与工单状态保持完好。
 
 ---
 

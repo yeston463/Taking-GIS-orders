@@ -7,7 +7,7 @@
     "dev": "vite --port=3000 --host=0.0.0.0",
     "build": "vite build",
     "start": "tsx server.ts",
-    "test": "tsx --test src/utils/order-utils.test.ts src/tests/api-and-security.test.ts src/tests/p0-p1-regressions.test.ts",
+    "test": "tsx --test src/utils/order-utils.test.ts src/tests/api-and-security.test.ts src/tests/p0-p1-regressions.test.ts src/tests/timeout-and-anonymization.test.ts",
     "test:rules": "tsx --test src/tests/firestore-rules.emulator.test.ts",
     "check:secrets": "tsx scripts/check-secrets.ts",
     "migrate:check": "tsx scripts/migrate-orders.ts",

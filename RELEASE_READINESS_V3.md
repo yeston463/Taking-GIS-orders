@@ -2,7 +2,7 @@
 
 ## 一、最终准入判定
 
-> **当前准入状态：`READY FOR STAGING`（2026-10-31 本地 P0/P1 修复验证通过：npm ci、lint、22 项测试、check:secrets、build 均通过；推送后需 GitHub CI 绿灯，Firestore 规则动态测试需要 Emulator）**
+> **当前准入状态：`READY FOR STAGING`（2026-11-02 本地 P0/P1 修复验证通过：npm ci、lint、34 项测试、check:secrets、build 均通过；推送后需 GitHub CI 绿灯，Firestore 规则动态测试需要 Emulator）**
 
 ### 判定依据对照
 - 为什么不是 `NOT READY`？

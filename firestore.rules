@@ -55,5 +55,12 @@ service cloud.firestore {
     match /idempotencyKeys/{key} {
       allow read, write: if false;
     }
+
+    // Durable query-token rotation records (which rotation key was consumed and
+    // which rotation version it issued). Written only inside the same server
+    // transaction that rotates the token; never readable or writable by a client.
+    match /tokenRotations/{key} {
+      allow read, write: if false;
+    }
   }
 }

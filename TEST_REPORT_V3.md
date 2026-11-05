@@ -80,7 +80,7 @@
 | :--- | :--- | :--- |
 | 依赖安装（含锁文件） | `npm ci` | PASS |
 | 类型检查（`strict: true`） | `npm run lint` | PASS |
-| 单元 + 隔离 API/安全测试 | `npm test` | PASS（22/22） |
+| 单元 + 隔离 API/安全测试 | `npm test` | PASS（35/35） |
 | 密钥扫描 | `npm run check:secrets` | PASS |
 | 生产构建 | `npm run build` | PASS |
 | Firestore 规则测试 | `npm run test:rules` | 本地无 Emulator：skipped（不再假绿）；CI 使用 `firebase emulators:exec` 强制运行 |
@@ -93,5 +93,11 @@
 | 新工单通知（可选） | `ORDER_NOTIFICATION_WEBHOOK_URL` + 回归测试 | PASS（发送脱敏联系方式，最多等待 3 秒且不影响建单） |
 | 依赖审计 | `npm audit` | 0 high / 0 critical；4 moderate 传递依赖（glob/minimatch/rimraf/google-gax） |
 | `npm run preview` | 预览服务器挂载 `/api` | PASS（与 dev/prod 相同的 API 路由） |
+| 写入超时语义 | `[Timeout]` 回归测试 | 写入超时报告 `DATABASE_TIMEOUT_OUTCOME_UNKNOWN` + `outcomeUnknown: true`，不再谎称未写入；迟到提交仍生效 |
+| 凭证重置幂等 | `[Rotation]` 回归测试 | 轮换键与轮换版本在**同一事务**内持久化（`/tokenRotations` + `rotationVersion` + `rotationHistory`）；当前版本重试返回同一凭证（`IDEMPOTENT_REPLAY`，`updatedAt`/`rotationVersion` 不变），被后续轮换取代的旧键返回 `409 ROTATION_SUPERSEDED` 且不签发任何凭证 |
+| 凭证重置并发 | `[Rotation]` 回归测试 | 同键并发三次仅一次 `ROTATED`（`rotationVersion` 只 +1，三者同一凭证）；“提交成功但响应丢失 → 新键 B → 重试 A”不覆盖 B；哈希挤出有界历史窗口后仍靠持久化记录拒绝；密钥配置与记录不一致时 `503 ROTATION_RECORD_MISMATCH` 失败关闭 |
+| TTL删除+历史淘汰重试 | `[Rotation]` 回归测试 | 针对“TTL 删除记录 + 历史淘汰 + 重试旧键”场景：工单自身持久化保存 `consumedRotationKeys` 且派生绑定版本；重试已消费旧键返回 `409 ROTATION_SUPERSEDED`，旧凭证不复活，当前凭证不失效，不返回 `ROTATED` |
+| 匿名化并发保护 | `[Anonymization]` + `[Rotation]` 回归测试 | 匿名化后的过期 PATCH 返回 400 且不恢复已清除数据；匿名化重试幂等；匿名化后任何轮换（含旧键重试）在事务内被拒绝，不交付凭证 |
+| 变异验证（本轮新增断言） | 临时改写 `rotateQueryTokenAtomic` 后重跑 | 移除“取代拒绝”分支 → 3 项失败；移除匿名化轮换守卫 → 2 项失败；不写入轮换记录 → 历史窗口外那 1 项失败；移除记录一致性检查 → 失败关闭那 1 项失败；随后按 SHA-256 校验还原源码一致 |
 
 > 说明：GitHub Actions 需在推送后重新运行；本记录不代表远程 CI 已通过。

@@ -23,3 +23,12 @@
 ## 2. `ADMIN_UIDS` 配置提醒
 - `ADMIN_UIDS` 必须是 Firebase Authentication 生成的真实 UID（通常 28 位），不能填写邮箱或邮箱前缀。服务端不会内置任何硬编码管理员 UID。
 - 若填写了邮箱前缀或过短的条目，这些条目会被拒绝，并可在管理员鉴权接口 `GET /api/admin/diagnostics` 的 `diagnostics.adminAuth.warnings` 中看到提示；未配置时 `configuredCount` 为 `0`。请使用 `/#admin` 页面 Google 登录后回显的真实 UID 更新配置。
+
+---
+
+## 3. 凭证轮换幂等（版本绑定轮换记录）的剩余限制
+- **测试驱动的是隔离仓储实现**：`[Rotation]` 回归测试通过 `IsolatedTestOrderRepository.rotateQueryTokenAtomic` 执行，其并发保护来自单进程互斥锁 + 同步事务体，**不能等价证明 Firestore 的乐观并发行为**。`FirestoreAdminOrderRepository.rotateQueryTokenAtomic` 依赖 `runTransaction` 对“事务内已读文档被他人改写”的冲突检测（ABORT 后自动重试）来获得同样的性质；该代码路径已通过类型检查、构建与逐行审查，但本地缺少可用的 Java/Firestore Emulator，未做真实事务并发执行验证（CI 亦仅覆盖安全规则，不覆盖该事务逻辑）。
+- **轮换记录 30 天 TTL 与工单持久化已消费键**：`/tokenRotations` 集合配置 30 天 TTL 清理以降低存储成本。为防止 TTL 清除且旧哈希挤出 12 条历史后重试旧键复活旧凭证，工单文档自身在事务内同时持久化维护 `consumedRotationKeys: Record<string, number>`（无 TTL），且凭证派生协议引入轮换版本后缀（`v${rotationVersion}`）。即使 `/tokenRotations` 记录已随 TTL 消失，服务端仍能通过工单自身记录辨识出已被取代的旧键并返回 `409 ROTATION_SUPERSEDED`，既不改写当前版本也不签发任何凭证。
+- **历史工单没有 `rotationVersion`**：迁移或旧版本创建的工单缺少轮换版本与历史字段，服务端按版本 `0` 处理，仅在其当前哈希匹配时允许重放；首次轮换后即写入完整字段。
+- **轮换密钥（pepper）变更后旧记录不可重放**：`QUERY_TOKEN_PEPPER` 一旦轮换，`/tokenRotations` 中记录的哈希与新的派生结果不一致，服务端返回 `503 ROTATION_RECORD_MISMATCH` 且不交付任何凭证（失败关闭）。同时所有既有查询凭证都会失效，必须通知客户由管理员重新签发。
+- **轮换记录文档 ID 为 `sha256(orderNumber|rotationKey)` 前 40 位**：仅用于寻址，原始幂等键不落库；该集合已在 `firestore.rules` 中 `allow read, write: if false`，客户端不可读写，服务端身份需 `roles/datastore.user`。

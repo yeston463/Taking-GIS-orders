@@ -34,7 +34,7 @@ async function isFirestoreEmulatorRunning(host: string, port: number): Promise<b
   }
 }
 
-test('P0-B Static Policy Check: firestore.rules enforces zero-trust server-only access on /orders, /rateLimits, /idempotencyKeys', () => {
+test('P0-B Static Policy Check: firestore.rules enforces zero-trust server-only access on /orders, /rateLimits, /idempotencyKeys, /tokenRotations', () => {
   const rulesPath = path.resolve(process.cwd(), 'firestore.rules');
   assert.equal(fs.existsSync(rulesPath), true, 'firestore.rules must exist in repository root');
   const rulesText = fs.readFileSync(rulesPath, 'utf-8');
@@ -51,6 +51,10 @@ test('P0-B Static Policy Check: firestore.rules enforces zero-trust server-only 
   assert.match(
     rulesText,
     /match\s+\/idempotencyKeys\/\{\w+\}\s*\{[\s\S]*?allow\s+read,\s*write:\s*if\s+false;/
+  );
+  assert.match(
+    rulesText,
+    /match\s+\/tokenRotations\/\{\w+\}\s*\{[\s\S]*?allow\s+read,\s*write:\s*if\s+false;/
   );
   assert.match(
     rulesText,

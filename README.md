@@ -16,9 +16,10 @@ GeoSpatial Studio 是一个面向科研团队、规划设计院与政企客户�
    - 工单号（`GEO-YYYYMMDD-XXXXXX`）与专属查询凭证（`QK-XXXX-XXXX-XXXX`）在创建时生成；无幂等键的请求使用 60-bit CSPRNG 拒绝采样生成凭证，浏览器会话请求则由服务端以 `HMAC-SHA256(pepper, orderNumber | idempotencyKey | contactValue)` 派生同一凭证。数据库仅存储 `HMAC-SHA256(pepper, orderNumber:queryToken)` 哈希（`queryTokenHash`），绝不存储明文凭证；凭证在管理员重置前有效，并非只能用一次。
    - 客户端提交时生成会话级 128-bit 幂等键（`X-Idempotency-Key`）。若首次提交因网络中断未收到响应，客户在同一会话内重试时服务端可安全校验并恢复原有效查询凭证（返回 `HTTP 200 OK`，`IDEMPOTENT_REPLAY`），前端明确区分“新订单创建成功”与“重复提交已识别”。
    - 若客户关闭标签页重开后在短期内重复提交相同内容（无原会话密钥），服务端返回 `HTTP 409 Conflict`（绝不返回 201 或假查询凭证），并提供联系工程师人工核验重置凭证（`POST /api/admin/orders/:id/rotate-token`）或确认强制新建独立工单（`forceNewOrder`）的清晰流程。
+   - **凭证轮换幂等与版本绑定**：管理员重置凭证（`POST /api/admin/orders/:id/rotate-token`，携带 `X-Idempotency-Key`）在**同一个 Firestore 事务**内同时改写工单与写入 `/tokenRotations/{sha256(orderNumber|key)}` 轮换记录（记录 `rotationVersion` 与该版本签发的 `queryTokenHash`）。工单另保存有界的 `rotationHistory`（最近被撤销的凭证哈希）。因此：同一操作重试且仍为当前版本 → `HTTP 200 IDEMPOTENT_REPLAY`，恢复原凭证且不改写 `updatedAt`；该操作已被后续轮换取代 → `HTTP 409 ROTATION_SUPERSEDED`，绝不回显旧凭证也不改写当前凭证；“提交成功但响应丢失”后由同键重试安全恢复。幂等判定来自持久化轮换记录与版本，绝不依赖进程内缓存，也不单纯依赖确定性派生（密钥配置与记录哈希不一致时直接失败关闭，`HTTP 503 ROTATION_RECORD_MISMATCH`）。已匿名化工单的事务内检查保持优先，任何轮换都不再签发凭证。
 4. **限流故障关闭 (Fail-Closed, P1-B) 与零信任安全规则 (P0-B)**：
    - 服务端限流采用进程内 L1 仅拒绝预检（防钱包耗尽攻击）+ Firestore 权威固定窗口事务计数；当限流后端发生超时、权限不足或网络故障时，公开建单与查询接口严格执行失败关闭（返回 `HTTP 503 RATE_LIMIT_BACKEND_UNAVAILABLE`），绝不静默降级为单机内存限流。
-   - `firestore.rules` 对 `/orders`、`/rateLimits`、`/idempotencyKeys` 实施 `allow read, write: if false;`，所有读写均通过服务端 Admin SDK 受控接口执行。
+   - `firestore.rules` 对 `/orders`、`/rateLimits`、`/idempotencyKeys`、`/tokenRotations` 实施 `allow read, write: if false;`，所有读写均通过服务端 Admin SDK 受控接口执行。
 5. **最小化公开健康检查与错误脱敏 (P1-C)**：
    - 公开 `GET /api/health` 仅返回基本服务状态与时间戳；详细配置一致性诊断收敛至管理员鉴权接口 `GET /api/admin/diagnostics`。
 
